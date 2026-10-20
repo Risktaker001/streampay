@@ -349,6 +349,19 @@ pub struct StorageMigrated {
     pub is_complete: bool,
 }
 
+/// Emitted when a single stream's storage record is re-encoded under a new
+/// layout version. Only fired when a rewrite actually happened: an
+/// already-current record migrates as a silent no-op, so the absence of this
+/// event is what makes repeated `migrate_stream_version` calls idempotent.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamRecordMigrated {
+    #[topic]
+    pub stream_id: u64,
+    pub from_version: u32,
+    pub to_version: u32,
+}
+
 /// Emitted when a stream policy floor/ceiling configuration is updated.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -198,13 +198,18 @@ pub enum Branch {
     NoPendingOwnership,
     /// `cancel_ownership_transfer`: the caller did not create the proposal.
     CancelProposalNotProposer,
+    // ------------------------------------------------ schema versioning
+    /// `stream::get_stream_record`: the stored record is tagged with a layout
+    /// version this build does not understand (or has a shape that matches
+    /// neither the current versioned layout nor the legacy one).
+    SchemaVersionUnsupported,
 }
 
 impl Branch {
     /// Every branch, in declaration order. The matrix test walks this list and
     /// the coverage test requires each [`StreamError`] variant to be produced by
     /// one of these (or retired).
-    pub const ALL: [Branch; 77] = [
+    pub const ALL: [Branch; 78] = [
         Branch::CreateDepositNonPositive,
         Branch::CreateStartTimeInPast,
         Branch::CreateInvalidTimeRange,
@@ -282,6 +287,7 @@ impl Branch {
         Branch::OwnershipProposalExpired,
         Branch::NoPendingOwnership,
         Branch::CancelProposalNotProposer,
+        Branch::SchemaVersionUnsupported,
     ];
 
     /// The entrypoint(s) through which this branch can fire. Shared helpers
@@ -312,6 +318,8 @@ impl Branch {
                 "sponsored_withdraw",
                 "propose_ownership_transfer",
                 "accept_ownership_transfer",
+                "stream_record_version",
+                "migrate_stream_version",
             ],
             Branch::StreamNotActive => &[
                 "withdraw",
@@ -406,6 +414,7 @@ impl Branch {
                 "propose_ownership_transfer",
                 "accept_ownership_transfer",
                 "cancel_ownership_transfer",
+                "migrate_stream_version",
             ],
             Branch::MigrationNotFrozen | Branch::AlreadyMigrated => &["migrate_storage"],
             Branch::ExecuteUpgradeNoPending | Branch::TimelockNotExpired => &["execute_upgrade"],
@@ -431,6 +440,17 @@ impl Branch {
                 &["accept_ownership_transfer", "cancel_ownership_transfer"]
             }
             Branch::CancelProposalNotProposer => &["cancel_ownership_transfer"],
+            Branch::SchemaVersionUnsupported => &[
+                "get_stream",
+                "available",
+                "withdraw",
+                "withdraw_max",
+                "cancel_stream",
+                "top_up",
+                "sponsored_withdraw",
+                "stream_record_version",
+                "migrate_stream_version",
+            ],
         }
     }
 
@@ -518,6 +538,7 @@ impl Branch {
             Branch::ProposeAlreadyPending => StreamError::OwnershipProposalPending,
             Branch::OwnershipProposalExpired => StreamError::OwnershipProposalExpired,
             Branch::NoPendingOwnership => StreamError::NoPendingOwnership,
+            Branch::SchemaVersionUnsupported => StreamError::SchemaVersionUnsupported,
         }
     }
 
@@ -664,6 +685,9 @@ impl Branch {
             Branch::NoPendingOwnership => "no ownership proposal is stored for the stream",
             Branch::CancelProposalNotProposer => {
                 "the caller did not create the pending ownership proposal"
+            }
+            Branch::SchemaVersionUnsupported => {
+                "the stored record carries a layout version this build does not understand"
             }
         }
     }

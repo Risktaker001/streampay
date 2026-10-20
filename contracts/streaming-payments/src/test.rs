@@ -6519,3 +6519,438 @@ fn ownership_events_are_emitted_with_expected_payloads() {
         [accepted.to_xdr(&f.env, &f.client.address)],
     );
 }
+
+// ------------------------------------------------- schema record versioning --
+//
+// Storage layout versioning: every persisted record carries an explicit version
+// tag on write, the legacy untagged layout stays readable, an unknown version
+// fails closed on every path, and one record can be re-encoded by anyone,
+// idempotently.
+
+/// The legacy (v1) layout is a bare `Stream` map: exactly these eleven keys, in
+/// declaration order, and no version tag anywhere.
+const V1_STREAM_FIELDS: [&str; 11] = [
+    "id",
+    "sender",
+    "recipient",
+    "token",
+    "deposit",
+    "withdrawn",
+    "start_time",
+    "end_time",
+    "cancelable",
+    "status",
+    "use_oracle",
+];
+
+/// Converts a host value to its XDR form.
+fn to_scval(env: &Env, val: soroban_sdk::Val) -> soroban_sdk::xdr::ScVal {
+    use soroban_sdk::TryFromVal;
+    soroban_sdk::xdr::ScVal::try_from_val(env, &val).unwrap()
+}
+
+/// Converts an XDR value back to its host form.
+fn to_host(env: &Env, scval: &soroban_sdk::xdr::ScVal) -> soroban_sdk::Val {
+    use soroban_sdk::TryFromVal;
+    soroban_sdk::Val::try_from_val(env, scval).unwrap()
+}
+
+/// Puts every map inside an ScVal into XDR canonical order. A host map is
+/// stored key-ordered and refuses an out-of-order one on import, so this is the
+/// wire form a record really has — whatever order its fields were declared in.
+fn canonicalize(scval: soroban_sdk::xdr::ScVal) -> soroban_sdk::xdr::ScVal {
+    use soroban_sdk::xdr::{ScMap, ScMapEntry, ScVal, ScVec};
+    match scval {
+        ScVal::Map(Some(ScMap(entries))) => {
+            let mut sorted: std::vec::Vec<ScMapEntry> = entries
+                .into_iter()
+                .map(|entry| ScMapEntry {
+                    key: canonicalize(entry.key),
+                    val: canonicalize(entry.val),
+                })
+                .collect();
+            sorted.sort();
+            ScVal::Map(Some(ScMap(sorted.try_into().unwrap())))
+        }
+        ScVal::Vec(Some(ScVec(values))) => ScVal::Vec(Some(ScVec(
+            values
+                .into_iter()
+                .map(canonicalize)
+                .collect::<std::vec::Vec<_>>()
+                .try_into()
+                .unwrap(),
+        ))),
+        other => other,
+    }
+}
+
+/// The map keys of an XDR map value, as strings, in sorted order: host maps
+/// are key-ordered, so the wire order is a property of the encoding, not of
+/// the declaration.
+fn scval_map_keys(map: &soroban_sdk::xdr::ScVal) -> Vec<&str> {
+    use soroban_sdk::xdr::ScVal;
+    let ScVal::Map(Some(entries)) = map else {
+        panic!("expected an ScVal map, got {map:?}");
+    };
+    let mut keys: Vec<&str> = entries
+        .iter()
+        .map(|entry| match &entry.key {
+            ScVal::Symbol(sym) => std::str::from_utf8(&sym.0[..]).unwrap(),
+            other => panic!("unexpected map key {other:?}"),
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// The field names of a layout, in the order the host stores them.
+fn sorted_field_names(fields: &[&'static str]) -> Vec<&'static str> {
+    let mut names = fields.to_vec();
+    names.sort_unstable();
+    names
+}
+
+/// Hand-encodes the legacy v1 blob for `s` as raw XDR: a map of the eleven
+/// original field names, assembled from per-field ScVals rather than through
+/// `Stream`'s own derive, so the test pins the *wire layout*.
+fn hand_encode_v1_blob(env: &Env, s: &crate::Stream) -> soroban_sdk::xdr::ScVal {
+    use soroban_sdk::xdr::{ScMap, ScMapEntry, ScSymbol, ScVal};
+    let fields: std::vec::Vec<(&str, soroban_sdk::Val)> = std::vec![
+        ("id", s.id.into_val(env)),
+        ("sender", s.sender.into_val(env)),
+        ("recipient", s.recipient.into_val(env)),
+        ("token", s.token.into_val(env)),
+        ("deposit", s.deposit.into_val(env)),
+        ("withdrawn", s.withdrawn.into_val(env)),
+        ("start_time", s.start_time.into_val(env)),
+        ("end_time", s.end_time.into_val(env)),
+        ("cancelable", s.cancelable.into_val(env)),
+        ("status", s.status.into_val(env)),
+        ("use_oracle", s.use_oracle.into_val(env)),
+    ];
+    let entries: std::vec::Vec<ScMapEntry> = fields
+        .into_iter()
+        .map(|(name, val)| ScMapEntry {
+            key: ScVal::Symbol(ScSymbol(name.as_bytes().to_vec().try_into().unwrap())),
+            val: canonicalize(to_scval(env, val)),
+        })
+        .collect();
+    canonicalize(ScVal::Map(Some(ScMap(entries.try_into().unwrap()))))
+}
+
+/// Overwrites a stored record with raw XDR, as a pre-versioning deploy would
+/// have written it. Storage is contract-scoped, so the write happens inside the
+/// contract's own context — the same footprint its entrypoints read.
+fn store_raw_record(f: &Fixture, id: u64, blob: &soroban_sdk::xdr::ScVal) {
+    let canonical = canonicalize(blob.clone());
+    f.env.as_contract(&f.client.address, || {
+        let val = to_host(&f.env, &canonical);
+        f.env
+            .storage()
+            .persistent()
+            .set(&crate::stream::DataKey::Stream(id), &val);
+    });
+}
+
+fn raw_record(f: &Fixture, id: u64) -> soroban_sdk::xdr::ScVal {
+    f.env.as_contract(&f.client.address, || {
+        let val: soroban_sdk::Val = f
+            .env
+            .storage()
+            .persistent()
+            .get(&crate::stream::DataKey::Stream(id))
+            .unwrap();
+        to_scval(&f.env, val)
+    })
+}
+
+#[test]
+fn records_are_written_with_an_explicit_version_tag() {
+    let f = Fixture::setup();
+    let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+    assert_eq!(
+        f.client.stream_record_version(&id),
+        crate::CURRENT_STREAM_RECORD_VERSION
+    );
+    // The tag is on the wire, not inferred: the stored map names it.
+    assert_eq!(
+        scval_map_keys(&raw_record(&f, id)),
+        sorted_field_names(&["stream", "version"])
+    );
+}
+
+#[test]
+fn an_unknown_stream_has_no_record_version() {
+    let f = Fixture::setup();
+    let client = f.client.mock_all_auths();
+    let err = client.try_stream_record_version(&999).unwrap_err().unwrap();
+    assert_eq!(err, StreamError::StreamNotFound);
+    let err = client
+        .try_migrate_stream_version(&999)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, StreamError::StreamNotFound);
+}
+
+#[test]
+fn xdr_v1_blob_migrates_to_a_field_for_field_identical_v2_record() {
+    let f = Fixture::setup();
+    let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+    let native = f.client.get_stream(&id);
+    // The natively-written record is the reference the migration must match.
+    let native_blob = raw_record(&f, id);
+
+    // The hand-encoder is faithful: it reproduces the derive's v1 output.
+    let legacy = hand_encode_v1_blob(&f.env, &native);
+    assert_eq!(
+        legacy,
+        canonicalize(to_scval(&f.env, native.into_val(&f.env))),
+        "hand-encoded v1 blob diverged from the Stream wire layout"
+    );
+    assert_eq!(
+        scval_map_keys(&legacy),
+        sorted_field_names(&V1_STREAM_FIELDS)
+    );
+
+    // Downgrade the record in place to the legacy layout.
+    store_raw_record(&f, id, &legacy);
+
+    // A v1 record stays readable, and reports its version as 1.
+    assert_eq!(
+        f.client.stream_record_version(&id),
+        crate::STREAM_RECORD_VERSION_V1
+    );
+    assert_eq!(f.client.get_stream(&id), native);
+
+    let report = f.client.mock_all_auths().migrate_stream_version(&id);
+    assert_eq!(
+        report,
+        crate::StreamVersionReport {
+            stream_id: id,
+            from_version: crate::STREAM_RECORD_VERSION_V1,
+            to_version: crate::CURRENT_STREAM_RECORD_VERSION,
+            migrated: true,
+        }
+    );
+
+    // Field-for-field *and* byte-for-byte identical to the native v2 record.
+    assert_eq!(raw_record(&f, id), native_blob);
+    assert_eq!(f.client.get_stream(&id), native);
+    assert_eq!(
+        f.client.stream_record_version(&id),
+        crate::CURRENT_STREAM_RECORD_VERSION
+    );
+}
+
+#[test]
+fn migrating_a_current_record_twice_is_a_no_op() {
+    let f = Fixture::setup();
+    let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+    let before = raw_record(&f, id);
+    let _ = f.env.events().all();
+
+    let report = f.client.mock_all_auths().migrate_stream_version(&id);
+    assert!(!report.migrated);
+    assert_eq!(report.from_version, report.to_version);
+    assert_eq!(report.to_version, crate::CURRENT_STREAM_RECORD_VERSION);
+    assert_eq!(raw_record(&f, id), before);
+    // No rewrite means no event: the second call is provably inert.
+    assert!(f
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&f.client.address)
+        .events()
+        .is_empty());
+
+    // Idempotence is not a one-shot property.
+    assert!(
+        !f.client
+            .mock_all_auths()
+            .migrate_stream_version(&id)
+            .migrated
+    );
+}
+
+#[test]
+fn migrating_a_legacy_record_emits_one_event_with_its_version_span() {
+    let f = Fixture::setup();
+    let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+    let native = f.client.get_stream(&id);
+    store_raw_record(&f, id, &hand_encode_v1_blob(&f.env, &native));
+    let _ = f.env.events().all();
+
+    f.client.mock_all_auths().migrate_stream_version(&id);
+    let expected = crate::StreamRecordMigrated {
+        stream_id: id,
+        from_version: crate::STREAM_RECORD_VERSION_V1,
+        to_version: crate::CURRENT_STREAM_RECORD_VERSION,
+    };
+    assert_eq!(
+        f.env.events().all().filter_by_contract(&f.client.address),
+        [expected.to_xdr(&f.env, &f.client.address)],
+    );
+}
+
+#[test]
+fn an_unknown_record_version_fails_closed_on_every_path() {
+    let f = Fixture::setup();
+    let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+    let unknown = crate::stream::VersionedStream {
+        version: crate::CURRENT_STREAM_RECORD_VERSION + 1,
+        stream: f.client.get_stream(&id),
+    };
+    store_raw_record(&f, id, &to_scval(&f.env, unknown.into_val(&f.env)));
+
+    // Refuse to decode: a layout this build has never seen is never guessed at.
+    let client = f.client.mock_all_auths();
+    let attempts: std::vec::Vec<Result<(), Result<StreamError, soroban_sdk::InvokeError>>> = std::vec![
+        client.try_get_stream(&id).map(|_| ()),
+        client.try_available(&id).map(|_| ()),
+        client.try_withdraw(&id, &1).map(|_| ()),
+        client.try_withdraw_max(&id).map(|_| ()),
+        client.try_cancel_stream(&f.sender, &id).map(|_| ()),
+        client.try_top_up(&id, &1).map(|_| ()),
+        client.try_stream_record_version(&id).map(|_| ()),
+        client.try_migrate_stream_version(&id).map(|_| ()),
+    ];
+    for attempt in attempts {
+        assert_eq!(
+            attempt.unwrap_err().unwrap(),
+            StreamError::SchemaVersionUnsupported
+        );
+    }
+}
+
+#[test]
+fn a_record_of_unrecognisable_shape_is_refused_not_mis_decoded() {
+    let f = Fixture::setup();
+    let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+    // Neither the v1 field set nor the tagged layout: garbage must not decode
+    // into a plausible-looking stream.
+    let mut bogus = hand_encode_v1_blob(&f.env, &f.client.get_stream(&id));
+    if let soroban_sdk::xdr::ScVal::Map(Some(map)) = &mut bogus {
+        let mut entries: std::vec::Vec<soroban_sdk::xdr::ScMapEntry> =
+            map.0.iter().cloned().collect();
+        entries.retain(|entry| {
+            !matches!(&entry.key, soroban_sdk::xdr::ScVal::Symbol(sym)
+                if sym.0.iter().as_slice() == b"start_time"
+                    || sym.0.iter().as_slice() == b"end_time")
+        });
+        *map = soroban_sdk::xdr::ScMap(entries.try_into().unwrap());
+    }
+    store_raw_record(&f, id, &bogus);
+    let err = f
+        .client
+        .mock_all_auths()
+        .try_get_stream(&id)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, StreamError::SchemaVersionUnsupported);
+}
+
+#[test]
+fn accrual_is_identical_across_layouts_at_window_boundaries() {
+    let f = Fixture::setup();
+    // Two streams sharing one window: one forced back to the legacy layout, one
+    // written natively. Their accrual must agree at every boundary.
+    let legacy_id = f.create_stream(DEPOSIT, DAY, 4 * DAY, false);
+    let native_id = f.create_stream(DEPOSIT, DAY, 4 * DAY, false);
+    let legacy = f.client.get_stream(&legacy_id);
+    store_raw_record(&f, legacy_id, &hand_encode_v1_blob(&f.env, &legacy));
+
+    // Boundaries walked in order: before start, mid-window, end-1, end, past end.
+    let mut before_end = None;
+    for step in 0..6 {
+        f.advance_time(DAY);
+        let legacy_available = f.client.available(&legacy_id);
+        assert_eq!(
+            legacy_available,
+            f.client.available(&native_id),
+            "legacy and native layouts diverged at step {step}"
+        );
+        if step == 3 {
+            before_end = Some(legacy_available);
+        }
+    }
+    assert!(before_end.is_some());
+
+    f.client.mock_all_auths().migrate_stream_version(&legacy_id);
+    // Past the window end both records settle on the full deposit, and the
+    // migrated record pays exactly what the native one owes.
+    assert_eq!(
+        f.client.available(&legacy_id),
+        f.client.available(&native_id)
+    );
+    assert_eq!(f.client.available(&legacy_id), DEPOSIT);
+    let paid = f.client.mock_all_auths().withdraw_max(&legacy_id);
+    assert_eq!(paid, DEPOSIT);
+}
+
+#[test]
+fn any_caller_can_migrate_and_the_batch_path_lands_on_the_current_layout() {
+    let f = Fixture::setup();
+    let legacy_id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+    let native = f.client.get_stream(&legacy_id);
+    store_raw_record(&f, legacy_id, &hand_encode_v1_blob(&f.env, &native));
+    let batch_id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+    let batch_stream = f.client.get_stream(&batch_id);
+
+    // Permissionless: no governor, no counterparty, no authorization at all.
+    f.client.mock_all_auths().migrate_stream_version(&legacy_id);
+    assert_eq!(
+        f.client.stream_record_version(&legacy_id),
+        crate::CURRENT_STREAM_RECORD_VERSION
+    );
+
+    // The governor-driven batch path rewrites the records it touches as well.
+    f.client.mock_all_auths().set_frozen(&f.governor, &true);
+    f.client
+        .mock_all_auths()
+        .migrate_storage(&f.governor, &1, &50);
+    f.client.mock_all_auths().set_frozen(&f.governor, &false);
+    assert_eq!(
+        f.client.stream_record_version(&batch_id),
+        crate::CURRENT_STREAM_RECORD_VERSION
+    );
+    assert_eq!(f.client.get_stream(&batch_id), batch_stream);
+    assert_eq!(f.client.get_stream(&legacy_id), native);
+}
+
+#[test]
+fn record_migration_is_refused_while_frozen() {
+    let f = Fixture::setup();
+    let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+    f.client.mock_all_auths().set_frozen(&f.governor, &true);
+    let err = f
+        .client
+        .mock_all_auths()
+        .try_migrate_stream_version(&id)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, StreamError::ContractFrozen);
+    // Reads keep working while frozen.
+    assert_eq!(
+        f.client.stream_record_version(&id),
+        crate::CURRENT_STREAM_RECORD_VERSION
+    );
+}
+
+/// The migration path's own Checks-Effects-Interactions trace: it never
+/// transfers tokens, so a rewrite is `read -> write -> event` and nothing else.
+#[test]
+fn migrate_stream_version_operation_order_matches_golden() {
+    let f = Fixture::setup_quiet();
+    let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+    let native = f.client.get_stream(&id);
+    store_raw_record(&f, id, &hand_encode_v1_blob(&f.env, &native));
+
+    crate::cei_trace::begin();
+    f.client.mock_all_auths().migrate_stream_version(&id);
+    let actual = crate::cei_trace::finish();
+
+    assert_eq!(
+        actual,
+        include_str!("../test_orderings/migrate_stream_version.txt").trim_end()
+    );
+}

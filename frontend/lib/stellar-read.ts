@@ -94,6 +94,18 @@ export async function readAvailable(streamId: string): Promise<bigint> {
   return BigInt(scValToNative(retval) as bigint);
 }
 
+/**
+ * The storage layout version a stream record carries, or `null` when the
+ * contract refused to read it: `stream_record_version` fails closed with
+ * `SchemaVersionUnsupported` on a layout this build does not understand, and a
+ * simulation error is exactly that signal. `scripts/migrate_audit.ts` walks the
+ * same view over an address's indexes.
+ */
+export async function readStreamRecordVersion(streamId: string): Promise<number | null> {
+  const retval = await simulateRead("stream_record_version", [u64(streamId)]);
+  return retval ? Number(scValToNative(retval) as number) : null;
+}
+
 export async function fetchStreamIdsPage(
   address: string,
   role: "recipient" | "sender",

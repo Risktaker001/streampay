@@ -23,6 +23,28 @@ interface: they are only ever appended to, never renumbered or reused.
 - New `StreamError` variants (appended): `NoPendingOwnership` (60),
   `OwnershipProposalExpired` (61), `InvalidTransferTarget` (62), and
   `OwnershipProposalPending` (63).
+- Explicit **storage record versioning**: every stream record is written as a
+  tagged `VersionedStream { version, stream }` envelope rather than a bare
+  `Stream`, so a record's layout is declared by the bytes instead of inferred
+  from them. Untagged pre-versioning records keep reading (as v1); a tag this
+  build has never seen fails closed on every path — reads, withdrawals,
+  cancellation, top-ups and the migration path itself — with the appended
+  `StreamError::SchemaVersionUnsupported` (64). New entrypoints
+  `migrate_stream_version(stream_id)` (permissionless, one record per call,
+  idempotent: re-running it on a current record is a byte-for-byte no-op) and
+  the `stream_record_version(stream_id)` view, plus the
+  `StreamRecordMigrated { stream_id, from_version, to_version }` event.
+  An XDR-level test hand-encodes a v1 blob, migrates it and asserts the result
+  is field-for-field identical to a natively-written record; accrual across the
+  two layouts is property-tested at window boundaries.
+- Off-chain migration planner: `scripts/migrate_audit.ts` (+
+  `scripts/migrate_audit.sh`) walks the per-address discovery indexes, decodes
+  every stream record it reaches and classifies its layout
+  (current / legacy / future / unrecognised), printing the plan as a table or
+  Markdown. The classification lives in `frontend/lib/migration-report.ts` and
+  is shared with the frontend; the golden report is
+  [`docs/MIGRATION_AUDIT.md`](docs/MIGRATION_AUDIT.md), regenerated and diffed
+  in CI. Documented in `docs/UPGRADES.md`.
 - Frontend (opt-in) **fee-aware claim scheduling**: a recipient can queue a
   signed `withdraw_max` intent and have the client submit it when the Soroban
   inclusion-fee percentile drops under a budget, with a deadline fallback so a

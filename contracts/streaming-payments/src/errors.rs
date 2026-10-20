@@ -186,6 +186,11 @@ pub enum StreamError {
     /// An unexpired ownership proposal already exists for this stream; cancel
     /// or accept it before proposing another.
     OwnershipProposalPending = 63,
+    /// A stored record uses a layout this build does not understand: its
+    /// version tag is from the future, or its shape decodes as neither the
+    /// current versioned layout nor the legacy untagged one. Reads fail closed
+    /// rather than guessing — see `stream::get_stream_record`.
+    SchemaVersionUnsupported = 64,
 }
 
 impl StreamError {
@@ -256,6 +261,7 @@ impl StreamError {
         StreamError::OwnershipProposalExpired,
         StreamError::InvalidTransferTarget,
         StreamError::OwnershipProposalPending,
+        StreamError::SchemaVersionUnsupported,
     ];
 
     /// The stable numeric value carried across the contract boundary

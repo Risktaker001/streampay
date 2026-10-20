@@ -100,8 +100,8 @@ pub use events::{
     PolicyHandoffAccepted, PolicyHandoffCancelled, PolicyHandoffProposed, PolicyInitialized,
     ScheduledIntentCancelled, ScheduledIntentExpired, ScheduledStreamExecuted, SponsorActiveSet,
     SponsorClaim, SponsorRegistered, StorageMigrated, StreamCancelled, StreamCreated,
-    StreamPolicySet, StreamScheduled, StreamToppedUp, StreamsCreated, UpgradeCancelled,
-    UpgradeProposed, Withdrawn,
+    StreamPolicySet, StreamRecordMigrated, StreamScheduled, StreamToppedUp, StreamsCreated,
+    UpgradeCancelled, UpgradeProposed, Withdrawn,
 };
 pub use oracle::{OracleConfig, OracleReport, ResolvedTime, DEFAULT_MAX_STALE_SECONDS};
 pub use policy::{validate_stream_args, validate_top_up_args, QueuedAssetChange, StreamPolicy};
@@ -111,9 +111,10 @@ pub use sponsor::{PeriodSpend, SponsorConfig};
 // calculators: it is a pure function requiring no `Env`.
 pub use stream::{
     streamed_at, BatchEntry, MigrationStatus, OwnershipRole, PendingOwnership, PendingUpgrade,
-    Stream, StreamStatus, INITIAL_SCHEMA_VERSION, MAX_BATCH, MAX_DURATION_SECONDS,
-    MAX_MIGRATION_BATCH_SIZE, MAX_PAGE_SIZE, MIN_BATCH, MIN_UPGRADE_DELAY_SECONDS,
-    OWNERSHIP_PROPOSAL_TTL_SECONDS, TARGET_SCHEMA_VERSION,
+    Stream, StreamStatus, StreamVersionReport, VersionedStream, CURRENT_STREAM_RECORD_VERSION,
+    INITIAL_SCHEMA_VERSION, MAX_BATCH, MAX_DURATION_SECONDS, MAX_MIGRATION_BATCH_SIZE,
+    MAX_PAGE_SIZE, MIN_BATCH, MIN_UPGRADE_DELAY_SECONDS, OWNERSHIP_PROPOSAL_TTL_SECONDS,
+    STREAM_RECORD_VERSION_V1, STREAM_RECORD_VERSION_V2, TARGET_SCHEMA_VERSION,
 };
 pub use treasury::{fee_amount, FeeScan, Treasury, TreasuryStatus, BPS_DENOMINATOR, MAX_FEE_BPS};
 
@@ -2157,6 +2158,59 @@ impl StreamingPayments {
             total_streams: total,
             is_complete,
         }
+    }
+
+    /// The storage layout version of a single stream record.
+    ///
+    /// `1` is the legacy untagged layout (a bare `Stream` map), `2` the
+    /// version-tagged [`VersionedStream`] every current write produces. Auditors
+    /// use this to answer "what still needs moving?" per stream without
+    /// decoding the record itself; see `scripts/migrate_audit.ts` for the
+    /// off-chain walk.
+    ///
+    /// Fails closed with [`StreamError::SchemaVersionUnsupported`] for a record
+    /// tagged with a layout this build does not understand, and with
+    /// [`StreamError::StreamNotFound`] when no record exists.
+    pub fn stream_record_version(env: Env, stream_id: u64) -> Result<u32, StreamError> {
+        stream::stream_record_version(&env, stream_id)
+    }
+
+    /// Re-encodes one stream record under [`CURRENT_STREAM_RECORD_VERSION`].
+    ///
+    /// **Idempotent: running it twice is a no-op.** A record that already
+    /// carries the current layout is reported with `migrated == false` and is
+    /// not rewritten, so it emits no event and changes no storage byte. Repeat
+    /// calls are safe from any number of keepers racing on the same stream.
+    ///
+    /// **Permissionless**: unlike the governor-driven [`StreamingPayments::
+    /// migrate_storage`] batch, anyone may migrate a single record — it moves
+    /// no funds and touches no accounting field, only the encoding of a stream
+    /// whose decoded state is provably unchanged. It is also gas-bounded by
+    /// construction: exactly one stream record is read and (at most) one
+    /// rewritten per call, so callers never pay for somebody else's backlog.
+    ///
+    /// Returns [`StreamError::StreamNotFound`] for an unknown id and
+    /// [`StreamError::SchemaVersionUnsupported`] for a record this build cannot
+    /// decode (there is nothing to re-encode *from*, so refusing is the only
+    /// safe answer). Migration is refused while the contract is frozen, like
+    /// every other state-mutating entrypoint.
+    pub fn migrate_stream_version(
+        env: Env,
+        stream_id: u64,
+    ) -> Result<StreamVersionReport, StreamError> {
+        Self::require_not_frozen(&env)?;
+        let report = stream::migrate_stream_record(&env, stream_id)?;
+        if report.migrated {
+            #[cfg(test)]
+            cei_trace::record("event StreamRecordMigrated");
+            StreamRecordMigrated {
+                stream_id,
+                from_version: report.from_version,
+                to_version: report.to_version,
+            }
+            .publish(&env);
+        }
+        Ok(report)
     }
 
     // ----------------------------------------------------------- oracle ----

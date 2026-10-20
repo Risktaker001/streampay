@@ -108,6 +108,33 @@ while true; do
 done
 ```
 
+### Phase 4b: Per-record layout tags and `migrate_stream_version`
+`schema_version` is the *contract-wide* epoch; it cannot tell you what layout a
+single stream record is stored in. Each record therefore carries its own
+explicit tag: `put_stream` writes a `VersionedStream { version, stream }`
+envelope rather than a bare `Stream`, and reads decode the tag instead of
+inferring a shape from the bytes.
+
+* **Views**: `stream_record_version(stream_id)` returns the tag a record
+  currently carries (`StreamError::StreamNotFound` if absent).
+* **Entrypoint**: `migrate_stream_version(stream_id)` — permissionless (any
+  account, no governor), gas-bounded to one record, and **idempotent**: a
+  record already on the current layout is neither rewritten nor re-emitted, so
+  running the call twice is a no-op. A record tagged with a layout this build
+  does not understand is refused with `StreamError::SchemaVersionUnsupported`
+  (#64) rather than guessed at — the same code every read path returns, so a
+  future layout fails closed everywhere at once.
+* **Event**: `StreamRecordMigrated { stream_id, from_version, to_version }`,
+  emitted only when a rewrite actually happened.
+* **Legacy reads**: an untagged record still reads correctly (it is interpreted
+  as v1) precisely so that a deployment can be upgraded without a stop-the-world
+  migration; the tag is what makes the *unknown* case distinguishable.
+* **Planning the work off-chain**: `bash scripts/migrate_audit.sh --contract
+  <C...> --owner <address>` walks the discovery indexes and prints which streams
+  are legacy, current, or blocked. The committed example report is
+  [docs/MIGRATION_AUDIT.md](MIGRATION_AUDIT.md), regenerated and diffed in CI by
+  `bash scripts/migrate_audit.sh --check`.
+
 ### Phase 5: Executing Code Upgrade
 Once the timelock duration has elapsed (`ledger.timestamp >= pending.unlock_time`), the governor triggers execution:
 * **Entrypoint**: `execute_upgrade(caller)`

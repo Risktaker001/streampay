@@ -369,6 +369,14 @@ jobs:
       - name: Check internal markdown links
         run: node scripts/check_docs_links.mjs
 
+      # The migration plan operators read (docs/MIGRATION_AUDIT.md) is generated
+      # from a captured record-layout snapshot, so changing the classifier or the
+      # snapshot without regenerating the report is drift. Regenerate and diff,
+      # with the same one command contributors run locally. Needs no npm install:
+      # the layout classifier is dependency-free by design.
+      - name: Migration audit report is up to date
+        run: bash scripts/migrate_audit.sh --check
+
       # A JSON file with the same key twice is valid JSON: `JSON.parse` and npm
       # keep the LAST occurrence and drop the earlier one without a word. Every
       # merge that appended a key at the same spot as another branch produced

@@ -198,6 +198,11 @@ pub trait StreamingPaymentsApi {
         count: u32,
     ) -> Result<MigrationStatus, StreamError>;
     fn migration_progress(env: Env) -> MigrationStatus;
+    fn stream_record_version(env: Env, stream_id: u64) -> Result<u32, StreamError>;
+    fn migrate_stream_version(
+        env: Env,
+        stream_id: u64,
+    ) -> Result<crate::StreamVersionReport, StreamError>;
     fn set_oracle_config(
         env: Env,
         caller: Address,

@@ -10,6 +10,7 @@
     "verify-fees": "node verify-fees.ts",
     "demo-anchor": "node anchor_offramp_demo.js",
     "drill:key-rotation": "node --experimental-strip-types key_rotation_drill.ts",
+    "migrate-audit": "node --experimental-strip-types migrate_audit.ts",
     "lint:docs-links": "node check_docs_links.mjs",
     "typecheck": "tsc --noEmit"
   },

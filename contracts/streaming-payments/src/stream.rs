@@ -6,7 +6,7 @@
 //! intermediate products) and returns [`StreamError::MathOverflow`] instead of
 //! overflowing or panicking.
 
-use soroban_sdk::{contracttype, Address, BytesN, Env, MuxedAddress, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Env, MuxedAddress, TryFromVal, Val, Vec};
 
 use crate::errors::StreamError;
 use crate::surface::{self, Branch};
@@ -22,6 +22,21 @@ pub const TARGET_SCHEMA_VERSION: u32 = 2;
 
 /// Maximum number of streams processed per migration call.
 pub const MAX_MIGRATION_BATCH_SIZE: u32 = 50;
+
+/// Storage-record layout of the original, **untagged** stream entries: the
+/// value stored under [`DataKey::Stream`] was a bare [`Stream`] struct, so its
+/// version could only be *inferred* from the absence of a version tag.
+pub const STREAM_RECORD_VERSION_V1: u32 = 1;
+
+/// Storage-record layout that carries an explicit version tag: the stored value
+/// is a [`VersionedStream`], so every record states its own layout version on
+/// write instead of leaving readers to guess.
+pub const STREAM_RECORD_VERSION_V2: u32 = 2;
+
+/// The record layout this build writes. Appending a field to [`Stream`] means
+/// bumping this constant (and, if the field is not an `Option`, adding a
+/// migration step in [`migrate_stream_record`]).
+pub const CURRENT_STREAM_RECORD_VERSION: u32 = STREAM_RECORD_VERSION_V2;
 
 /// Maximum supported stream duration: 100 years, including leap days
 /// (36,525 days). Bounds worst-case rate multiplications and rejects
@@ -105,6 +120,11 @@ pub enum StreamStatus {
 }
 
 /// Full state of a payment stream.
+///
+/// Field order and names are the storage wire format: appending a field is a
+/// schema change that bumps [`CURRENT_STREAM_RECORD_VERSION`], and the field
+/// must be an `Option` (or defaulted by a migration) so older records keep
+/// decoding.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Stream {
@@ -131,6 +151,34 @@ impl Stream {
     pub fn duration(&self) -> u64 {
         self.end_time - self.start_time
     }
+}
+
+/// A persisted [`Stream`] record together with the storage layout version it was
+/// written under.
+///
+/// This is the value stored under [`DataKey::Stream`] for every record written
+/// by [`put_stream`]; the `version` field is written explicitly, never inferred.
+/// [`get_stream_record`] decodes the legacy untagged [`STREAM_RECORD_VERSION_V1`]
+/// layout as well, so records created before versioned writes landed keep
+/// working until they are migrated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VersionedStream {
+    pub version: u32,
+    pub stream: Stream,
+}
+
+/// Outcome of [`migrate_stream_record`]: which layout a single stream moved
+/// from and to, and whether it moved at all.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamVersionReport {
+    pub stream_id: u64,
+    pub from_version: u32,
+    pub to_version: u32,
+    /// False when the record already carried the current layout, so nothing was
+    /// rewritten — the proof that migration is idempotent.
+    pub migrated: bool,
 }
 
 /// Parameters for creating a single stream within a batch creation call.
@@ -171,7 +219,9 @@ pub struct MigrationStatus {
 pub enum DataKey {
     /// Next stream id to hand out; ids start at 1.
     NextStreamId,
-    /// The stream with the given id.
+    /// The stream with the given id. Stored as a [`VersionedStream`] by
+    /// current builds; [`STREAM_RECORD_VERSION_V1`] records (a bare [`Stream`]
+    /// with no version tag) remain readable until migrated.
     Stream(u64),
     /// Append-only index of stream ids where the given address is the
     /// recipient. Advisory (discovery) data: the `Stream` entries remain the
@@ -358,21 +408,91 @@ pub fn reserve_stream_ids(env: &Env, count: u32) -> Result<u64, StreamError> {
 }
 
 /// Loads a stream, or returns [`StreamError::StreamNotFound`].
+///
+/// A thin wrapper over [`get_stream_record`] that discards the layout version.
 pub fn get_stream(env: &Env, id: u64) -> Result<Stream, StreamError> {
-    #[cfg(test)]
-    crate::cei_trace::record(&std::format!("read persistent Stream({id})"));
-    env.storage()
-        .persistent()
-        .get(&DataKey::Stream(id))
-        .ok_or_else(|| surface::reject(Branch::StreamNotFound))
+    Ok(get_stream_record(env, id)?.stream)
 }
 
-/// Persists a stream and extends its storage TTL.
+/// Loads a stream together with the storage layout version its record carries.
+///
+/// Both layouts are readable: the current [`VersionedStream`] tag and the
+/// legacy untagged [`Stream`] map (reported as [`STREAM_RECORD_VERSION_V1`]).
+/// The probe order is deliberate — the tagged layout is tried first, and a
+/// record that decodes as *neither* layout is refused with
+/// [`StreamError::SchemaVersionUnsupported`] rather than being guessed at.
+/// That is the fail-closed half of versioning: a record written by a future
+/// build with fields this build has never seen can never be silently
+/// mis-decoded into a present-day [`Stream`].
+pub fn get_stream_record(env: &Env, id: u64) -> Result<VersionedStream, StreamError> {
+    #[cfg(test)]
+    crate::cei_trace::record(&std::format!("read persistent Stream({id})"));
+    let key = DataKey::Stream(id);
+    // Reading as a raw `Val` cannot fail: shape probing happens below with
+    // fallible conversions, not through the storage getter's infallible ones.
+    let Some(raw): Option<Val> = env.storage().persistent().get(&key) else {
+        return Err(surface::reject(Branch::StreamNotFound));
+    };
+    if let Ok(record) = VersionedStream::try_from_val(env, &raw) {
+        // Unknown tags — from the future *or* malformed — are refused: only a
+        // layout this build actually understands may be decoded.
+        if record.version < STREAM_RECORD_VERSION_V1
+            || record.version > CURRENT_STREAM_RECORD_VERSION
+        {
+            return Err(surface::reject(Branch::SchemaVersionUnsupported));
+        }
+        return Ok(record);
+    }
+    if let Ok(stream) = Stream::try_from_val(env, &raw) {
+        return Ok(VersionedStream {
+            version: STREAM_RECORD_VERSION_V1,
+            stream,
+        });
+    }
+    Err(surface::reject(Branch::SchemaVersionUnsupported))
+}
+
+/// The storage layout version of one stream record.
+pub fn stream_record_version(env: &Env, id: u64) -> Result<u32, StreamError> {
+    Ok(get_stream_record(env, id)?.version)
+}
+
+/// Re-encodes one stream record under [`CURRENT_STREAM_RECORD_VERSION`].
+///
+/// Idempotent by construction: a record that already carries the current layout
+/// is reported with `migrated = false` and left untouched (no rewrite, so no
+/// storage delta and no event). Callable by anyone — it changes no accounting,
+/// only the encoding of a record that is already provably equivalent — and it
+/// touches exactly one storage entry, which is what bounds its gas.
+pub fn migrate_stream_record(env: &Env, id: u64) -> Result<StreamVersionReport, StreamError> {
+    let record = get_stream_record(env, id)?;
+    if record.version == CURRENT_STREAM_RECORD_VERSION {
+        return Ok(StreamVersionReport {
+            stream_id: id,
+            from_version: record.version,
+            to_version: record.version,
+            migrated: false,
+        });
+    }
+    put_stream(env, &record.stream);
+    Ok(StreamVersionReport {
+        stream_id: id,
+        from_version: record.version,
+        to_version: CURRENT_STREAM_RECORD_VERSION,
+        migrated: true,
+    })
+}
+
+/// Persists a stream under the current versioned layout and extends its storage TTL.
 pub fn put_stream(env: &Env, stream: &Stream) {
     #[cfg(test)]
     crate::cei_trace::record(&std::format!("write persistent Stream({})", stream.id));
     let key = DataKey::Stream(stream.id);
-    env.storage().persistent().set(&key, stream);
+    let record = VersionedStream {
+        version: CURRENT_STREAM_RECORD_VERSION,
+        stream: stream.clone(),
+    };
+    env.storage().persistent().set(&key, &record);
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);

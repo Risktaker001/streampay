@@ -977,6 +977,24 @@ fn probe(branch: Branch) -> Option<StreamError> {
         Branch::AvailableBalanceOverflow | Branch::CancelSplitOverflow | Branch::PayoutOverflow => {
             None
         }
+        Branch::SchemaVersionUnsupported => {
+            let f = Fixture::setup_quiet();
+            let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+            let stream = f.client.get_stream(&id);
+            // Forge a record tagged with a layout this build has never seen —
+            // exactly what a downgrade (or a corrupted write) would produce.
+            let future = crate::stream::VersionedStream {
+                version: crate::stream::CURRENT_STREAM_RECORD_VERSION + 1,
+                stream,
+            };
+            f.env.as_contract(&f.client.address, || {
+                f.env
+                    .storage()
+                    .persistent()
+                    .set(&DataKey::Stream(id), &future);
+            });
+            Some(rejected!(f.client.mock_all_auths().try_get_stream(&id)))
+        }
     }
 }
 
@@ -1146,7 +1164,8 @@ fn stream_error_variant_list_is_exhaustive() {
             | StreamError::NoPendingOwnership
             | StreamError::OwnershipProposalExpired
             | StreamError::InvalidTransferTarget
-            | StreamError::OwnershipProposalPending => StreamError::ALL.contains(&e),
+            | StreamError::OwnershipProposalPending
+            | StreamError::SchemaVersionUnsupported => StreamError::ALL.contains(&e),
         }
     }
 
