@@ -23,7 +23,10 @@ use crate::sponsor;
 use crate::stream::{streamed_at, DataKey};
 use crate::surface::{trace, Branch, Reachability, RETIRED_CODES};
 use crate::test::{Fixture, RefusingFixture};
-use crate::{StreamError, MAX_DURATION_SECONDS, MAX_FEE_BPS, OWNERSHIP_PROPOSAL_TTL_SECONDS};
+use crate::{
+    StreamError, MAX_DURATION_SECONDS, MAX_FEE_BPS, MAX_WITHDRAW_BATCH,
+    OWNERSHIP_PROPOSAL_TTL_SECONDS,
+};
 
 const DAY: u64 = 24 * 60 * 60;
 const DEPOSIT: i128 = 10_000_000_000;
@@ -53,6 +56,23 @@ macro_rules! rejected {
             .expect_err("expected the contract to reject the call")
             .unwrap()
     };
+}
+
+/// Reads the per-entry rejection out of a `withdraw_many` batch that itself
+/// succeeded — reporting an entry as skipped *is* success for the call, which
+/// is exactly what per-entry isolation means.
+macro_rules! skipped {
+    ($call:expr) => {{
+        let rows = crate::test::batch_rows(
+            $call
+                .expect("expected the batch call to succeed")
+                .expect("expected no whole-batch rejection"),
+        );
+        match rows.first() {
+            Some(Err(error)) => *error,
+            _ => panic!("expected the entry to be skipped"),
+        }
+    }};
 }
 
 // ------------------------------------------- sponsorship probe scaffolding ---
@@ -1104,6 +1124,54 @@ fn probe(branch: Branch) -> Option<StreamError> {
                 .mock_all_auths()
                 .try_set_refund_target(&f.sender, &id, &f.sender)))
         }
+        // ------------------------------------------------ batch withdraw
+        Branch::WithdrawManyEmpty => {
+            let f = Fixture::setup_quiet();
+            let ids = soroban_sdk::Vec::new(&f.env);
+            Some(rejected!(f.client.mock_all_auths().try_withdraw_many(
+                &f.recipient,
+                &ids,
+                &false
+            )))
+        }
+        Branch::WithdrawManyTooLarge => {
+            let f = Fixture::setup_quiet();
+            let mut ids = soroban_sdk::Vec::new(&f.env);
+            for id in 1u64..=(MAX_WITHDRAW_BATCH as u64 + 1) {
+                ids.push_back(id);
+            }
+            Some(rejected!(f.client.mock_all_auths().try_withdraw_many(
+                &f.recipient,
+                &ids,
+                &false
+            )))
+        }
+        Branch::WithdrawManyDuplicateIds => {
+            let f = Fixture::setup_quiet();
+            let id = f.create_stream(DEPOSIT, 0, 10 * DAY, false);
+            let mut ids = soroban_sdk::Vec::new(&f.env);
+            ids.push_back(id);
+            ids.push_back(id);
+            Some(rejected!(f.client.mock_all_auths().try_withdraw_many(
+                &f.recipient,
+                &ids,
+                &false
+            )))
+        }
+        Branch::WithdrawManyNotStreamRecipient => {
+            let f = Fixture::setup_quiet();
+            let id = f.create_stream(DEPOSIT, 0, 10 * DAY, false);
+            let mut ids = soroban_sdk::Vec::new(&f.env);
+            ids.push_back(id);
+            // A stranger batching a known id cannot claim someone else's
+            // accrual; the entry is reported, not paid.
+            let other = soroban_sdk::Address::generate(&f.env);
+            Some(skipped!(f
+                .client
+                .mock_all_auths()
+                .try_withdraw_many(&other, &ids, &false)))
+        }
+        Branch::WithdrawManyTotalOverflow => None,
     }
 }
 
@@ -1199,6 +1267,7 @@ fn defensive_branches_are_exactly_documented() {
             Branch::AvailableBalanceOverflow,
             Branch::CancelSplitOverflow,
             Branch::PayoutOverflow,
+            Branch::WithdrawManyTotalOverflow,
         ],
         "the defensive set changed; update the matrix test and docs/ERROR_SURFACE.md"
     );
@@ -1282,7 +1351,10 @@ fn stream_error_variant_list_is_exhaustive() {
             | StreamError::SenderTransferPending
             | StreamError::SenderTransferNotConsenter
             | StreamError::RefundTargetNotSender
-            | StreamError::RefundTargetUnchanged => StreamError::ALL.contains(&e),
+            | StreamError::RefundTargetUnchanged
+            | StreamError::WithdrawBatchEmpty
+            | StreamError::WithdrawBatchTooLarge
+            | StreamError::WithdrawDuplicateStreamIds => StreamError::ALL.contains(&e),
         }
     }
 

@@ -35,9 +35,9 @@ use soroban_sdk::{
 use crate::stream::streamed_at;
 use crate::test_client::StreamingPaymentsClient as Client;
 use crate::{
-    OwnershipRole, StreamError, StreamInput, StreamStatus, StreamingPayments,
-    INITIAL_SCHEMA_VERSION, MAX_DURATION_SECONDS, MIN_UPGRADE_DELAY_SECONDS,
-    OWNERSHIP_PROPOSAL_TTL_SECONDS, TARGET_SCHEMA_VERSION,
+    OwnershipRole, StreamError, StreamInput, StreamStatus, StreamingPayments, WithdrawEntry,
+    WithdrawOutcome, INITIAL_SCHEMA_VERSION, MAX_DURATION_SECONDS, MAX_WITHDRAW_BATCH,
+    MIN_UPGRADE_DELAY_SECONDS, OWNERSHIP_PROPOSAL_TTL_SECONDS, TARGET_SCHEMA_VERSION,
 };
 
 // ---------------------------------------------------------------- fixtures --
@@ -5018,6 +5018,18 @@ fn freeze_and_unfreeze_governor_controls_and_mutation_gates() {
         .unwrap();
     assert_eq!(err, StreamError::ContractFrozen);
 
+    // 6. withdraw_many — the batch gate runs before any entry is read, so a
+    // frozen contract cannot be claimed through the batch path either.
+    let mut ids = soroban_sdk::Vec::new(&f.env);
+    ids.push_back(id);
+    let err = f
+        .client
+        .mock_all_auths()
+        .try_withdraw_many(&f.recipient, &ids, &false)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, StreamError::ContractFrozen);
+
     // All read-only views remain completely functional while frozen:
     let s = f.client.get_stream(&id);
     assert_eq!(s.id, id);
@@ -8734,5 +8746,797 @@ fn run_routing_fuzz(seed: u64, steps: usize) {
                 "{ctx}: refunds to {holder:?}"
             );
         }
+    }
+}
+
+// ------------------------------------------------- batch withdraw (#205) ---
+
+/// Builds the `stream_ids` argument of a `withdraw_many` call.
+fn batch_ids(env: &Env, ids: &[u64]) -> soroban_sdk::Vec<u64> {
+    let mut v = soroban_sdk::Vec::new(env);
+    for id in ids {
+        v.push_back(*id);
+    }
+    v
+}
+
+/// A batch answer flattened, in request order, to `Ok(amount)` / `Err(code)` —
+/// the shape the assertions below read most naturally. A skipped entry carries
+/// its reason as a numeric code on the wire (see `WithdrawEntry`), so this turns
+/// it back into the variant it came from.
+pub fn batch_rows(entries: soroban_sdk::Vec<WithdrawEntry>) -> Vec<Result<i128, StreamError>> {
+    entries
+        .iter()
+        .map(|entry| {
+            if entry.code == 0 {
+                Ok(entry.amount)
+            } else {
+                Err(*StreamError::ALL
+                    .iter()
+                    .find(|error| error.code() == entry.code)
+                    .unwrap_or_else(|| panic!("batch answer carried code {}", entry.code)))
+            }
+        })
+        .collect()
+}
+
+/// Mints and re-approves so `count` streams of `DEPOSIT` can be funded by the
+/// fixture's sender (which starts with two deposits, enough for the single-stream
+/// tests but not for a full batch).
+fn fund_for_streams(f: &Fixture, count: i128) {
+    let sac = StellarAssetClient::new(&f.env, &f.token);
+    sac.mint(&f.sender, &(count * DEPOSIT));
+    sac.approve(
+        &f.sender,
+        &f.client.address,
+        &(count * DEPOSIT),
+        &1_000_000u32,
+    );
+}
+
+/// Creates a stream paying `recipient` (not necessarily the fixture's own),
+/// starting `start_in` seconds from now and running `duration` seconds.
+fn create_stream_to(f: &Fixture, recipient: &Address, start_in: u64, duration: u64) -> u64 {
+    let now = f.env.ledger().timestamp();
+    f.client.mock_all_auths().create_stream(
+        &f.sender,
+        recipient,
+        &f.token,
+        &DEPOSIT,
+        &(now + start_in),
+        &(now + start_in + duration),
+        &true,
+    )
+}
+
+#[test]
+fn withdraw_many_operation_order_matches_golden() {
+    let f = Fixture::setup_quiet();
+    let vested = f.create_stream(DEPOSIT, 0, DAY, true);
+    let cancelled = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+    f.advance_time(DAY);
+    f.client
+        .mock_all_auths()
+        .cancel_stream(&f.sender, &cancelled);
+
+    crate::cei_trace::begin();
+    // One settled entry, one refused for its status, one that never existed:
+    // the trace shows the batch touching each record once, in request order,
+    // and writing only for the entry that pays.
+    f.client.mock_all_auths().withdraw_many(
+        &f.recipient,
+        &batch_ids(&f.env, &[vested, cancelled, 99]),
+        &false,
+    );
+    let actual = crate::cei_trace::finish();
+
+    assert_eq!(
+        actual,
+        include_str!("../test_orderings/withdraw_many.txt").trim_end()
+    );
+}
+
+#[test]
+fn withdraw_many_settles_eligible_streams_and_reports_the_rest() {
+    let f = Fixture::setup();
+    fund_for_streams(&f, 4);
+    // Fully vested: one day of a one-day stream.
+    let first = f.create_stream(DEPOSIT, 0, DAY, true);
+    let second = f.create_stream(DEPOSIT, 0, DAY, true);
+    // Not started yet, so nothing has accrued: skipped, not paid.
+    let later = f.create_stream(DEPOSIT, 5 * DAY, 10 * DAY, true);
+    // Cancelled before the claim: a terminal stream cannot be claimed.
+    let cancelled = f.create_stream(DEPOSIT, 0, 10 * DAY, true);
+
+    f.advance_time(DAY);
+    f.client
+        .mock_all_auths()
+        .cancel_stream(&f.sender, &cancelled);
+
+    let ids = batch_ids(&f.env, &[first, second, later, cancelled, 99]);
+    let before = TokenClient::new(&f.env, &f.token).balance(&f.recipient);
+    let rows = batch_rows(
+        f.client
+            .mock_all_auths()
+            .withdraw_many(&f.recipient, &ids, &false),
+    );
+
+    assert_eq!(
+        rows,
+        std::vec![
+            Ok(DEPOSIT),
+            Ok(DEPOSIT),
+            Err(StreamError::NothingToWithdraw),
+            Err(StreamError::StreamNotActive),
+            Err(StreamError::StreamNotFound),
+        ]
+    );
+
+    // Only the two settled entries moved tokens.
+    assert_eq!(
+        TokenClient::new(&f.env, &f.token).balance(&f.recipient),
+        before + 2 * DEPOSIT
+    );
+    // The skipped entries are untouched: the not-yet-started stream has never
+    // paid, and the cancelled one kept the balance its cancellation settled.
+    assert_eq!(f.client.get_stream(&later).withdrawn, 0);
+    assert_eq!(f.client.get_stream(&later).status, StreamStatus::Active);
+    assert_eq!(f.client.get_stream(&first).status, StreamStatus::Depleted);
+    assert_eq!(f.client.get_stream(&second).status, StreamStatus::Depleted);
+}
+
+/// The batch answers every requested id with a *plain map* — an amount, or the
+/// stable numeric code that skipped it — never with an `ScError`. That is a
+/// wire-format decision, not a style one: `scValToNative` in
+/// `@stellar/stellar-sdk` has no conversion for an error value, so a skipped
+/// entry carried as `Result::Err` would make the whole batch undecodable, which
+/// is the opposite of per-entry isolation. Pinned here because the frontend
+/// decode depends on it.
+#[test]
+fn withdraw_many_answers_carry_the_amount_or_the_stable_error_code() {
+    let f = Fixture::setup();
+    fund_for_streams(&f, 2);
+    let paid = f.create_stream(DEPOSIT, 0, DAY, true);
+    let cancelled = f.create_stream(DEPOSIT, 0, 10 * DAY, true);
+    f.advance_time(DAY);
+    f.client
+        .mock_all_auths()
+        .cancel_stream(&f.sender, &cancelled);
+
+    let entries = f.client.mock_all_auths().withdraw_many(
+        &f.recipient,
+        &batch_ids(&f.env, &[paid, cancelled, 99]),
+        &false,
+    );
+
+    let expected = std::vec![
+        WithdrawEntry {
+            stream_id: paid,
+            amount: DEPOSIT,
+            code: 0,
+        },
+        WithdrawEntry {
+            stream_id: cancelled,
+            amount: 0,
+            code: StreamError::StreamNotActive.code(),
+        },
+        WithdrawEntry {
+            stream_id: 99,
+            amount: 0,
+            code: StreamError::StreamNotFound.code(),
+        },
+    ];
+    // One answer per id, in the order they were requested.
+    assert_eq!(entries.iter().collect::<Vec<_>>(), expected);
+}
+
+#[test]
+fn withdraw_many_emits_one_summary_alongside_the_per_stream_events() {
+    let f = Fixture::setup();
+    let id = f.create_stream(DEPOSIT, 0, DAY, true);
+    f.advance_time(DAY);
+
+    f.client
+        .mock_all_auths()
+        .withdraw_many(&f.recipient, &batch_ids(&f.env, &[id]), &false);
+
+    let withdrawn = crate::Withdrawn {
+        stream_id: id,
+        recipient: f.recipient.clone(),
+        amount: DEPOSIT,
+        withdrawn_total: DEPOSIT,
+    };
+    // The batch adds exactly one event, and the per-stream event keeps its
+    // existing shape: consumers that only know `Withdrawn` see nothing change.
+    let summary = crate::BatchWithdrawSummary {
+        recipient: f.recipient.clone(),
+        settled: {
+            let mut paid = soroban_sdk::Vec::new(&f.env);
+            paid.push_back(WithdrawOutcome {
+                stream_id: id,
+                amount: DEPOSIT,
+            });
+            paid
+        },
+        total: DEPOSIT,
+        requested: 1,
+        skipped: 0,
+    };
+    assert_eq!(
+        f.env.events().all().filter_by_contract(&f.client.address),
+        [
+            withdrawn.to_xdr(&f.env, &f.client.address),
+            summary.to_xdr(&f.env, &f.client.address),
+        ]
+    );
+}
+
+#[test]
+fn withdraw_many_bounds_the_batch_and_rejects_duplicates_upfront() {
+    let f = Fixture::setup();
+    let id = f.create_stream(DEPOSIT, 0, DAY, true);
+    f.advance_time(DAY);
+
+    // Empty: nothing to claim, and the call says so instead of settling zero.
+    assert_eq!(
+        rejected_batch(&f, &[], false),
+        StreamError::WithdrawBatchEmpty
+    );
+
+    // One over the cap: rejected before any stream is read.
+    let oversized: Vec<u64> = (1..=MAX_WITHDRAW_BATCH + 1).map(|n| n as u64).collect();
+    assert_eq!(
+        rejected_batch(&f, &oversized, false),
+        StreamError::WithdrawBatchTooLarge
+    );
+
+    // Exactly at the cap: accepted. These ids are all above anything this
+    // fixture created, so every entry is reported — the point is that the call
+    // itself runs and answers one row per request.
+    let at_cap: Vec<u64> = (1_000..1_000 + MAX_WITHDRAW_BATCH as u64).collect();
+    let rows = batch_rows(f.client.mock_all_auths().withdraw_many(
+        &f.recipient,
+        &batch_ids(&f.env, &at_cap),
+        &false,
+    ));
+    assert_eq!(rows.len(), MAX_WITHDRAW_BATCH as usize);
+    assert!(rows
+        .iter()
+        .all(|row| *row == Err(StreamError::StreamNotFound)));
+
+    // A repeated id would let the second entry claim against state the first
+    // one just rewrote, so the whole call is refused rather than de-duplicated.
+    assert_eq!(
+        rejected_batch(&f, &[id, id], false),
+        StreamError::WithdrawDuplicateStreamIds
+    );
+
+    // The refusal is upfront: the stream is still fully unwithdrawn and the
+    // recipient still holds nothing, as if the call had never happened.
+    assert_eq!(f.client.get_stream(&id).withdrawn, 0);
+    assert_eq!(TokenClient::new(&f.env, &f.token).balance(&f.recipient), 0);
+}
+
+/// Calls `withdraw_many` expecting the whole call to be rejected, and returns
+/// the code it rejected with.
+fn rejected_batch(f: &Fixture, ids: &[u64], strict: bool) -> StreamError {
+    f.client
+        .mock_all_auths()
+        .try_withdraw_many(&f.recipient, &batch_ids(&f.env, ids), &strict)
+        .unwrap_err()
+        .unwrap()
+}
+
+#[test]
+fn withdraw_many_never_claims_another_recipients_stream() {
+    let f = Fixture::setup();
+    fund_for_streams(&f, 2);
+    let mine = f.create_stream(DEPOSIT, 0, DAY, true);
+    let stranger = Address::generate(&f.env);
+    let theirs = create_stream_to(&f, &stranger, 0, DAY);
+    f.advance_time(DAY);
+
+    // The stranger batches the fixture recipient's stream. They authorized the
+    // call as themselves, so only the per-entry ownership check stands between
+    // them and a payout — and the entry is reported, not paid.
+    let rows = batch_rows(f.client.mock_all_auths().withdraw_many(
+        &stranger,
+        &batch_ids(&f.env, &[mine]),
+        &false,
+    ));
+    assert_eq!(rows, std::vec![Err(StreamError::NotAuthorized)]);
+    assert_eq!(f.client.get_stream(&mine).withdrawn, 0);
+    assert_eq!(TokenClient::new(&f.env, &f.token).balance(&stranger), 0);
+    assert_eq!(TokenClient::new(&f.env, &f.token).balance(&f.recipient), 0);
+
+    // Their *own* stream, claimed by them, settles normally: the check is
+    // identity, not suspicion of batches — but only after the owner has been
+    // kept out of it, so the ledger below is still theirs to change.
+    let rows = batch_rows(f.client.mock_all_auths().withdraw_many(
+        &f.recipient,
+        &batch_ids(&f.env, &[mine, theirs]),
+        &false,
+    ));
+    assert_eq!(
+        rows,
+        std::vec![Ok(DEPOSIT), Err(StreamError::NotAuthorized)]
+    );
+    // The foreign entry was skipped: its ledger is byte-for-byte the record the
+    // stranger's stream still had, and nothing reached the caller who named it.
+    assert_eq!(f.client.get_stream(&theirs).withdrawn, 0);
+    assert_eq!(
+        TokenClient::new(&f.env, &f.token).balance(&f.recipient),
+        DEPOSIT
+    );
+    assert_eq!(TokenClient::new(&f.env, &f.token).balance(&stranger), 0);
+
+    let rows = batch_rows(f.client.mock_all_auths().withdraw_many(
+        &stranger,
+        &batch_ids(&f.env, &[theirs]),
+        &false,
+    ));
+    assert_eq!(rows, std::vec![Ok(DEPOSIT)]);
+    assert_eq!(f.client.get_stream(&theirs).withdrawn, DEPOSIT);
+    assert_eq!(
+        TokenClient::new(&f.env, &f.token).balance(&stranger),
+        DEPOSIT
+    );
+}
+
+#[test]
+fn withdraw_many_requires_the_recipients_authorization() {
+    let f = Fixture::setup();
+    let id = f.create_stream(DEPOSIT, 0, DAY, true);
+    f.advance_time(DAY);
+
+    // The batch is authorized by the address it pays, so signing as somebody
+    // else does not let a caller claim on a recipient's behalf.
+    let attacker = Address::generate(&f.env);
+    f.env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &f.client.address,
+            fn_name: "withdraw_many",
+            args: (attacker.clone(), batch_ids(&f.env, &[id]), false).into_val(&f.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(f
+        .client
+        .try_withdraw_many(&f.recipient, &batch_ids(&f.env, &[id]), &false)
+        .is_err());
+    assert_eq!(f.client.get_stream(&id).withdrawn, 0);
+    assert_eq!(TokenClient::new(&f.env, &f.token).balance(&f.recipient), 0);
+}
+
+#[test]
+fn withdraw_many_strict_aborts_the_whole_batch() {
+    let f = Fixture::setup();
+    fund_for_streams(&f, 4);
+    let first = f.create_stream(DEPOSIT, 0, DAY, true);
+    let second = f.create_stream(DEPOSIT, 0, DAY, true);
+    let stranger = Address::generate(&f.env);
+    let theirs = create_stream_to(&f, &stranger, 0, DAY);
+    f.advance_time(DAY);
+
+    // Strict, with the failure last: the two entries that would have settled
+    // are rolled back with the refused one.
+    assert_eq!(
+        rejected_batch(&f, &[first, second, theirs], true),
+        StreamError::NotAuthorized
+    );
+    assert_eq!(f.client.get_stream(&first).withdrawn, 0);
+    assert_eq!(f.client.get_stream(&second).withdrawn, 0);
+    assert_eq!(TokenClient::new(&f.env, &f.token).balance(&f.recipient), 0);
+    assert_eq!(
+        TokenClient::new(&f.env, &f.token).balance(&f.client.address),
+        3 * DEPOSIT
+    );
+
+    // The same batch, non-strict: partial success is the default.
+    let rows = batch_rows(f.client.mock_all_auths().withdraw_many(
+        &f.recipient,
+        &batch_ids(&f.env, &[first, second, theirs]),
+        &false,
+    ));
+    assert_eq!(
+        rows,
+        std::vec![Ok(DEPOSIT), Ok(DEPOSIT), Err(StreamError::NotAuthorized)]
+    );
+    assert_eq!(
+        TokenClient::new(&f.env, &f.token).balance(&f.recipient),
+        2 * DEPOSIT
+    );
+
+    // Strict with everything eligible settles all of it: the flag changes only
+    // the failure behaviour, never the success path.
+    let third = f.create_stream(DEPOSIT, 0, DAY, true);
+    f.advance_time(DAY);
+    let rows = batch_rows(f.client.mock_all_auths().withdraw_many(
+        &f.recipient,
+        &batch_ids(&f.env, &[third]),
+        &true,
+    ));
+    assert_eq!(rows, std::vec![Ok(DEPOSIT)]);
+}
+
+#[test]
+fn withdraw_many_settles_exactly_what_sequential_single_claims_would() {
+    // Two identical portfolios: one claimed through the batch, the other
+    // through one transaction per stream. Identical end state is the proof that
+    // the batch invents no accrual, ordering, or rounding behaviour of its own.
+    let batched = claim_portfolio(false);
+    let sequential = claim_portfolio(true);
+    assert_eq!(
+        batched, sequential,
+        "withdraw_many diverged from {} single claims",
+        MAX_WITHDRAW_BATCH
+    );
+}
+
+/// Creates [`MAX_WITHDRAW_BATCH`] streams with staggered windows, advances a
+/// shared clock, claims them all (`singles` selects one `withdraw_max`
+/// transaction per stream, otherwise one `withdraw_many`), and returns the
+/// resulting ledger plus what the recipient was paid.
+fn claim_portfolio(singles: bool) -> (Vec<(u64, i128, StreamStatus)>, i128) {
+    let f = Fixture::setup();
+    fund_for_streams(&f, MAX_WITHDRAW_BATCH as i128);
+    let mut ids = Vec::new();
+    for n in 0..MAX_WITHDRAW_BATCH {
+        let n = n as u64;
+        let start_in = (n % 3) * DAY;
+        let duration = (2 + (n % 5)) * DAY;
+        ids.push(create_stream_to(&f, &f.recipient, start_in, duration));
+    }
+    f.advance_time(3 * DAY);
+
+    if singles {
+        for id in ids.iter() {
+            f.client.mock_all_auths().withdraw_max(id);
+        }
+    } else {
+        f.client
+            .mock_all_auths()
+            .withdraw_many(&f.recipient, &batch_ids(&f.env, &ids), &false);
+    }
+
+    let ledger: Vec<(u64, i128, StreamStatus)> = ids
+        .iter()
+        .map(|id| {
+            let s = f.client.get_stream(id);
+            (s.id, s.withdrawn, s.status)
+        })
+        .collect();
+    // The paid total is compared too: identical per-stream ledgers with a
+    // different balance would mean the batch paid someone else.
+    (
+        ledger,
+        TokenClient::new(&f.env, &f.token).balance(&f.recipient),
+    )
+}
+
+/// A token that refuses the payout arrives *after* that entry's state write
+/// and event, so it cannot be reported per-entry: the whole batch reverts, and
+/// the entries that already settled are rolled back with it. Skipping a failed
+/// payout instead would mean un-writing effects after an external call — the
+/// reentrancy hazard CEI exists to prevent.
+#[test]
+fn withdraw_many_aborts_the_whole_batch_when_a_payout_is_refused() {
+    let f = RefusingFixture::setup_quiet();
+    let good = f.create(DEPOSIT, 0, 10 * DAY);
+    // A second asset, on the same network, that has stopped paying out.
+    let refusing = f.env.register(RefusingToken, ());
+    RefusingTokenClient::new(&f.env, &refusing).set_refuse(&true, &false);
+    let now = f.env.ledger().timestamp();
+    let bad = f.client.mock_all_auths().create_stream(
+        &f.sender,
+        &f.recipient,
+        &refusing,
+        &DEPOSIT,
+        &now,
+        &(now + 10 * DAY),
+        &true,
+    );
+    f.advance_time(DAY);
+
+    let mut ids = soroban_sdk::Vec::new(&f.env);
+    ids.push_back(good);
+    ids.push_back(bad);
+    let err = f
+        .client
+        .mock_all_auths()
+        .try_withdraw_many(&f.recipient, &ids, &false)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, StreamError::RecipientPayoutFailed);
+
+    // The entry that had already been written and evented is gone: the host
+    // discarded the transaction, effects included.
+    assert_eq!(f.client.get_stream(&good).withdrawn, 0);
+    assert_eq!(f.client.get_stream(&good).status, StreamStatus::Active);
+    assert_eq!(f.client.get_stream(&bad).withdrawn, 0);
+}
+
+#[test]
+fn withdraw_many_footprint_harness() {
+    // The gas report for issue #205: one batch of MAX_WITHDRAW_BATCH claims
+    // against the same claims issued as that many separate transactions.
+    //
+    // `cost_estimate()` reports the budget of the *last* host invocation, not a
+    // running total, so each separate claim is reset and read on its own and
+    // then summed — that sum is what a recipient without batching pays.
+    let f = Fixture::setup();
+    fund_for_streams(&f, MAX_WITHDRAW_BATCH as i128);
+    let mut ids = Vec::new();
+    for _ in 0..MAX_WITHDRAW_BATCH {
+        ids.push(f.create_stream(DEPOSIT, 0, DAY, true));
+    }
+    f.advance_time(DAY);
+    let batch = batch_ids(&f.env, &ids);
+
+    f.env.cost_estimate().budget().reset_unlimited();
+    f.client
+        .mock_all_auths()
+        .withdraw_many(&f.recipient, &batch, &false);
+    let batch_cpu = f.env.cost_estimate().budget().cpu_instruction_cost();
+    let batch_mem = f.env.cost_estimate().budget().memory_bytes_cost();
+
+    // An identical portfolio, claimed one stream at a time.
+    let g = Fixture::setup();
+    fund_for_streams(&g, MAX_WITHDRAW_BATCH as i128);
+    let singles: Vec<u64> = (0..MAX_WITHDRAW_BATCH)
+        .map(|_| g.create_stream(DEPOSIT, 0, DAY, true))
+        .collect();
+    g.advance_time(DAY);
+    let mut singles_cpu = 0u64;
+    let mut singles_mem = 0u64;
+    let mut one_cpu = 0u64;
+    let mut one_mem = 0u64;
+    for id in singles.iter() {
+        g.env.cost_estimate().budget().reset_unlimited();
+        g.client.mock_all_auths().withdraw_max(id);
+        let cpu = g.env.cost_estimate().budget().cpu_instruction_cost();
+        one_cpu = cpu;
+        one_mem = g.env.cost_estimate().budget().memory_bytes_cost();
+        singles_cpu += cpu;
+        singles_mem += one_mem;
+    }
+
+    std::println!(
+        "GAS_REPORT: n={} withdraw_many cpu={} mem={} | withdraw_max cpu={} mem={} | withdraw_max x n cpu={} mem={} | saved cpu={} mem={}",
+        MAX_WITHDRAW_BATCH,
+        batch_cpu,
+        batch_mem,
+        one_cpu,
+        one_mem,
+        singles_cpu,
+        singles_mem,
+        singles_cpu - batch_cpu,
+        singles_mem - batch_mem
+    );
+    assert!(
+        batch_cpu < singles_cpu,
+        "the batch cost more than {} separate claims ({batch_cpu} vs {singles_cpu})",
+        MAX_WITHDRAW_BATCH
+    );
+    // Batching must not make an individual claim more expensive: the whole
+    // point is that a recipient with many streams pays closer to one
+    // transaction's fixed overhead, not twenty.
+    assert!(
+        batch_cpu < one_cpu * MAX_WITHDRAW_BATCH as u64,
+        "the batch costs more than its own entries ({batch_cpu} for {} claims, {} each)",
+        MAX_WITHDRAW_BATCH,
+        one_cpu
+    );
+
+    // The worst case that fits the cap must actually fit the transaction
+    // budget: 20 claims across one asset, plus the summary event. Soroban's
+    // per-transaction ceiling is 100M instructions; the cap is held well below
+    // it so a full batch leaves room for the caller's own footprint and rent.
+    assert!(
+        batch_cpu <= 8_000_000,
+        "withdraw_many of {MAX_WITHDRAW_BATCH} streams exceeded budget: {batch_cpu}"
+    );
+}
+
+/// Random batches — subsets, duplicates, foreign and unknown ids, both strict
+/// modes — must never pay more than accrued, never touch a stream the request
+/// did not name, and never leave the escrow inconsistent.
+#[test]
+fn random_withdraw_many_batches_never_pay_more_than_accrued() {
+    for seed in [0x5EED_2051, 0x5EED_2052, 0x5EED_2053, 0x5EED_2054] {
+        run_withdraw_many_fuzz(seed, 40);
+    }
+}
+
+fn run_withdraw_many_fuzz(seed: u64, rounds: usize) {
+    struct Entry {
+        id: u64,
+        start: u64,
+        end: u64,
+        /// The model's own claim on the stream, independent of storage.
+        withdrawn: i128,
+    }
+
+    let f = Fixture::setup_quiet();
+    let mut rng = Rng(seed | 1);
+    fund_for_streams(&f, 12);
+    let stranger = Address::generate(&f.env);
+
+    // Three streams for the batch caller, three for somebody else: a batch can
+    // mix them freely, and only the caller's own may ever pay.
+    let mut mine: Vec<Entry> = Vec::new();
+    let mut theirs: Vec<Entry> = Vec::new();
+    for side in 0..6 {
+        let now = f.env.ledger().timestamp();
+        let start_in = rng.below(3 * DAY);
+        let duration = DAY + rng.below(4 * DAY);
+        let owner = if side < 3 { &f.recipient } else { &stranger };
+        let id = create_stream_to(&f, owner, start_in, duration);
+        let entry = Entry {
+            id,
+            start: now + start_in,
+            end: now + start_in + duration,
+            withdrawn: 0,
+        };
+        if side < 3 {
+            mine.push(entry);
+        } else {
+            theirs.push(entry);
+        }
+    }
+
+    for round in 0..rounds {
+        let ctx = format!("seed {seed:#x} round {round}");
+        f.advance_time(1 + rng.below(DAY));
+        let now = f.env.ledger().timestamp();
+
+        // A request of 1..=8 ids over the caller's streams, the stranger's, and
+        // ids that were never created — with duplicates mixed in sometimes.
+        let len = 1 + rng.below(8) as usize;
+        let mut request: Vec<u64> = Vec::new();
+        for i in 0..len {
+            let pick = rng.below(4);
+            let id = match pick {
+                0 => mine[rng.below(mine.len() as u64) as usize].id,
+                1 => theirs[rng.below(theirs.len() as u64) as usize].id,
+                // A previously chosen id, to exercise the duplicate gate.
+                2 if !request.is_empty() => request[rng.below(request.len() as u64) as usize],
+                _ => 900 + i as u64,
+            };
+            request.push(id);
+        }
+        let duplicates = {
+            let mut sorted = request.clone();
+            sorted.sort();
+            sorted.dedup();
+            sorted.len() != request.len()
+        };
+        let strict = rng.below(2) == 1;
+
+        let recipient_before = TokenClient::new(&f.env, &f.token).balance(&f.recipient);
+        let stranger_before = TokenClient::new(&f.env, &f.token).balance(&stranger);
+
+        // `Ok(rows)` — the batch ran, and each row carries its own verdict.
+        // `Err(code)` — the call itself was refused, so nothing settled.
+        let outcome: Result<soroban_sdk::Vec<WithdrawEntry>, StreamError> = match f
+            .client
+            .mock_all_auths()
+            .try_withdraw_many(&f.recipient, &batch_ids(&f.env, &request), &strict)
+        {
+            Ok(Ok(rows)) => Ok(rows),
+            Ok(Err(undecoded)) => {
+                panic!("{ctx}: the outcome vector did not decode: {undecoded:?}")
+            }
+            Err(rejected) => Err(rejected.unwrap()),
+        };
+
+        if duplicates {
+            match outcome {
+                Err(err) => assert_eq!(
+                    err,
+                    StreamError::WithdrawDuplicateStreamIds,
+                    "{ctx}: the duplicate gate returned the wrong code"
+                ),
+                Ok(_) => panic!("{ctx}: a duplicate id must reject the whole call"),
+            }
+        } else {
+            match outcome {
+                Err(err) => {
+                    assert!(strict, "{ctx}: a non-strict batch never aborts: {err:?}");
+                    // The abort is total: no entry paid, so nothing moved.
+                    assert_eq!(
+                        TokenClient::new(&f.env, &f.token).balance(&f.recipient),
+                        recipient_before,
+                        "{ctx}: a strict abort still paid out"
+                    );
+                }
+                Ok(outcomes) => {
+                    let rows = batch_rows(outcomes);
+                    assert_eq!(rows.len(), request.len(), "{ctx}: one row per request");
+
+                    // Walk the batch the way the contract does: each entry is judged
+                    // against the state the previous entries left behind.
+                    let mut paid = 0i128;
+                    for (row, id) in rows.iter().zip(request.iter()) {
+                        let owned = mine.iter().position(|e| e.id == *id);
+                        let foreign = theirs.iter().position(|e| e.id == *id);
+                        match (owned, foreign) {
+                            (Some(i), _) => {
+                                let duration = mine[i].end - mine[i].start;
+                                let elapsed = now.saturating_sub(mine[i].start).min(duration);
+                                let accrued = streamed_at(DEPOSIT, duration, elapsed).unwrap();
+                                if mine[i].withdrawn == DEPOSIT {
+                                    // Fully claimed: the record is Depleted, and a
+                                    // terminal stream is refused on status, not amount.
+                                    assert_eq!(
+                                        *row,
+                                        Err(StreamError::StreamNotActive),
+                                        "{ctx}: depleted {id}"
+                                    );
+                                } else if accrued <= mine[i].withdrawn {
+                                    assert_eq!(
+                                        *row,
+                                        Err(StreamError::NothingToWithdraw),
+                                        "{ctx}: nothing accrued yet for {id}"
+                                    );
+                                } else {
+                                    let expected = accrued - mine[i].withdrawn;
+                                    assert_eq!(*row, Ok(expected), "{ctx}: paid amount for {id}");
+                                    mine[i].withdrawn += expected;
+                                    paid += expected;
+                                }
+                            }
+                            (None, Some(_)) => {
+                                assert_eq!(
+                                    *row,
+                                    Err(StreamError::NotAuthorized),
+                                    "{ctx}: foreign {id}"
+                                );
+                            }
+                            (None, None) => {
+                                assert_eq!(
+                                    *row,
+                                    Err(StreamError::StreamNotFound),
+                                    "{ctx}: unknown {id}"
+                                );
+                            }
+                        }
+                    }
+
+                    // What the batch reports as paid is exactly what arrived.
+                    assert_eq!(
+                        TokenClient::new(&f.env, &f.token).balance(&f.recipient),
+                        recipient_before + paid,
+                        "{ctx}: recipient balance vs the reported rows"
+                    );
+                    assert_eq!(
+                        TokenClient::new(&f.env, &f.token).balance(&stranger),
+                        stranger_before,
+                        "{ctx}: a batch by one recipient paid another"
+                    );
+                }
+            }
+        }
+
+        // Every stored record matches the model, streams outside the request
+        // included — isolation must not leak into its neighbours.
+        for entry in mine.iter().chain(theirs.iter()) {
+            let s = f.client.get_stream(&entry.id);
+            assert_eq!(
+                s.withdrawn, entry.withdrawn,
+                "{ctx}: ledger for {}",
+                entry.id
+            );
+        }
+
+        // Conservation: the contract escrows exactly what nobody has claimed.
+        let escrow = TokenClient::new(&f.env, &f.token).balance(&f.client.address);
+        let still_escrowed: i128 = mine
+            .iter()
+            .chain(theirs.iter())
+            .map(|e| DEPOSIT - e.withdrawn)
+            .sum();
+        assert_eq!(escrow, still_escrowed, "{ctx}: escrow");
     }
 }

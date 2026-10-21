@@ -19,6 +19,7 @@ import {
 } from "@stellar/stellar-sdk";
 import { signTransaction } from "@stellar/freighter-api";
 import type { BatchStreamEntry } from "./batch";
+import { validateBatchSelection } from "./withdrawal";
 import {
   globalFrontendTracer,
   registerTraceCorrelation,
@@ -578,6 +579,105 @@ export async function claimStreamWithReceipt(
     amount: result,
     streamId,
   };
+}
+
+/**
+ * One entry of a `withdraw_many` result, in the order it was requested.
+ * The contract answers every id it was given, so `rows.length` equals the
+ * request length and a skipped stream is still identifiable.
+ */
+export interface BatchClaimRow {
+  streamId: string;
+  /** Tokens delivered — `0n` for an entry that was skipped. */
+  amount: bigint;
+  /** False when the entry was skipped; `code` then says why. */
+  settled: boolean;
+  /** `0` when settled, otherwise the stable `StreamError` code that skipped it. */
+  code: number;
+}
+
+export interface BatchClaimReceipt {
+  txHash: string;
+  rows: BatchClaimRow[];
+  /** Sum of the settled amounts: what the recipient actually received. */
+  total: bigint;
+}
+
+/**
+ * Claims up to `MAX_WITHDRAW_BATCH` streams in a single transaction
+ * (`withdraw_many`). Each entry settles through the same per-stream path as
+ * [`claimStreamWithReceipt`](claimStreamWithReceipt), and a stream that cannot
+ * pay is reported in the rows instead of failing the call — one exhausted or
+ * cancelled stream no longer blocks the other nineteen.
+ *
+ * `strict` mirrors the contract's all-or-nothing flag: with it set, the first
+ * entry that cannot pay aborts the whole batch.
+ */
+export async function claimStreamsWithReceipt(
+  recipient: string,
+  streamIds: string[],
+  strict = false
+): Promise<BatchClaimReceipt> {
+  const selection = validateBatchSelection(streamIds);
+  if (!selection.valid) {
+    throw new Error(selection.error);
+  }
+
+  return globalFrontendTracer.withSpan(
+    "browser.claim_click",
+    async (span) => {
+      span.setAttributes({
+        "user.action": "claim_batch",
+        "batch.size": streamIds.length,
+        "recipient.address": sanitizeAddress(recipient),
+      });
+
+      const { result, txHash } = await sendWithTx(
+        recipient,
+        contract().call(
+          "withdraw_many",
+          scAddr(recipient),
+          xdr.ScVal.scvVec(streamIds.map((id) => u64(id))),
+          nativeToScVal(strict)
+        ),
+        (v) => {
+          const decoded: unknown = scValToNative(v);
+          if (!Array.isArray(decoded) || decoded.length !== streamIds.length) {
+            throw new Error("Contract returned an invalid batch claim result.");
+          }
+          // Every entry decodes to the same map: the contract answers a skipped
+          // stream with its numeric error code rather than an error *value*,
+          // because `scValToNative` has no conversion for an ScVal carrying an
+          // ScError — one skipped entry would otherwise fail the whole batch.
+          return decoded.map((value) => {
+            const row = value as { stream_id: bigint; amount: bigint; code: number };
+            const code = Number(row.code);
+            return {
+              streamId: String(row.stream_id),
+              amount: BigInt(row.amount),
+              settled: code === 0,
+              code,
+            };
+          });
+        }
+      );
+
+      if (txHash) {
+        span.setAttribute("soroban.tx_hash", txHash);
+        // Correlated by transaction, not by stream: every event this call
+        // publishes — the per-stream `Withdrawn` rows and the batch summary —
+        // carries the same tx hash.
+        registerTraceCorrelation(txHash, span.context);
+      }
+
+      return {
+        txHash,
+        rows: result,
+        total: result.reduce((sum, row) => sum + row.amount, 0n),
+      };
+    },
+    { kind: "CLIENT" }
+  );
 }
 
 export async function topUpStream(

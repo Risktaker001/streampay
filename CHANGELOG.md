@@ -94,6 +94,33 @@ interface: they are only ever appended to, never renumbered or reused.
   detail page warns when the destination differs from the sender, and randomised
   route/cancel/transfer sequences are fuzzed against an independent model.
   Documented in `docs/ARCHITECTURE.md` §19.
+- **Batch claiming**: `withdraw_many(recipient, stream_ids, strict)` settles up to
+  `MAX_WITHDRAW_BATCH` (20) streams in one transaction, running the *same*
+  per-stream claim path as `withdraw_max` (shared `settle_accrued` tail) so
+  accrual math, TTL extension and the `Withdrawn` event are identical by
+  construction rather than restated. It answers one entry per requested id, in
+  request order — `{ stream_id, amount, code }`, `code` being `0` for a stream
+  that paid and otherwise the `StreamError` that skipped it — so a stream that
+  cannot pay is skipped instead of reverting its siblings; `strict` makes any
+  per-entry rejection revert the whole call. The code travels as a number rather
+  than as a `Result` because a ScVal carrying an `ScError` has no off-chain
+  decoder, so one skipped entry would otherwise make the whole batch undecodable.
+  One authorization covers the batch
+  and every entry must belong to the caller, so a holder cannot claim a
+  counterparty's stream by listing its id. The bounds are checked before any
+  state is read: empty (73), over-cap (74) and duplicate ids (75) each revert
+  outright, because a repeated id would claim against state its first entry had
+  already rewritten. A refused *payout* is the one error that aborts rather than
+  skips: its state write and event precede the token call, as CEI requires, and
+  cannot be undone for a single entry. Append-only:
+  `BatchWithdrawSummary { recipient(topic), settled, total, requested, skipped }`
+  alongside the unchanged per-stream events. The indexer subscribes to the
+  summary and journals it without projecting it — the per-stream `withdrawn`
+  rows stay authoritative — and the stream list gains multi-select batch claims
+  behind `NEXT_PUBLIC_BATCH_CLAIM`. Measured: 20 claims in one call cost 6.27M
+  CPU against 7.99M as 20 transactions (`docs/FOOTPRINT.md` §4.1), asserted by
+  `withdraw_many_footprint_harness`; randomised batches over duplicates, foreign
+  streams and mixed tokens are fuzzed against an independent model.
 - Frontend (opt-in) **fee-aware claim scheduling**: a recipient can queue a
   signed `withdraw_max` intent and have the client submit it when the Soroban
   inclusion-fee percentile drops under a budget, with a deadline fallback so a

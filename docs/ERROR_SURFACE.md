@@ -8,19 +8,19 @@ Every expected failure is a `StreamError` with a stable numeric code. This docum
 
 | Code | Variant | Status | Processed by | Meaning |
 | ---: | --- | --- | --- | --- |
-| 1 | `StreamNotFound` | reachable (1 branch(es)) | `accept_ownership_transfer`, `accept_sender_transfer`, `available`, `cancel_stream`, `get_stream`, `migrate_stream_version`, `propose_ownership_transfer`, `propose_sender_transfer`, `refund_target`, `sender_history`, `set_refund_target`, `sponsored_withdraw`, `stream_record_version`, `top_up`, `withdraw`, `withdraw_max` | no stream is stored under the id |
+| 1 | `StreamNotFound` | reachable (1 branch(es)) | `accept_ownership_transfer`, `accept_sender_transfer`, `available`, `cancel_stream`, `get_stream`, `migrate_stream_version`, `propose_ownership_transfer`, `propose_sender_transfer`, `refund_target`, `sender_history`, `set_refund_target`, `sponsored_withdraw`, `stream_record_version`, `top_up`, `withdraw`, `withdraw_many`, `withdraw_max` | no stream is stored under the id |
 | 2 | `NotStreamSender` | **retired** (unreachable) | — | Reserved role check from the original draft. The contract authorizes sender-only actions by comparing the caller address directly and uses `NotAuthorized` (#12) otherwise, so this variant is never returned. Retained for wire compatibility. |
 | 3 | `NotStreamRecipient` | **retired** (unreachable) | — | Reserved role check from the original draft. Recipient-only actions require the recipient's authorization (`require_auth`) and use `NotAuthorized` (#12) for business-rule rejections, so this variant is never returned. Retained for wire compatibility. |
 | 4 | `StreamNotCancellable` | reachable (1 branch(es)) | `cancel_stream` | the recipient calls cancel_stream on a stream created non-cancelable |
-| 5 | `StreamNotActive` | reachable (1 branch(es)) | `accept_ownership_transfer`, `accept_sender_transfer`, `cancel_stream`, `propose_ownership_transfer`, `propose_sender_transfer`, `set_refund_target`, `sponsored_withdraw`, `top_up`, `withdraw`, `withdraw_max` | the stream status is Cancelled or Depleted |
+| 5 | `StreamNotActive` | reachable (1 branch(es)) | `accept_ownership_transfer`, `accept_sender_transfer`, `cancel_stream`, `propose_ownership_transfer`, `propose_sender_transfer`, `set_refund_target`, `sponsored_withdraw`, `top_up`, `withdraw`, `withdraw_many`, `withdraw_max` | the stream status is Cancelled or Depleted |
 | 6 | `StartTimeInPast` | reachable (1 branch(es)) | `create_stream`, `create_streams` | start_time is before the current ledger timestamp |
 | 7 | `InvalidTimeRange` | reachable (1 branch(es)) | `create_stream`, `create_streams` | end_time is not strictly after start_time (zero or negative duration) |
 | 8 | `DurationTooLong` | reachable (1 branch(es)) | `create_stream`, `create_streams` | duration exceeds MAX_DURATION_SECONDS (100 years) |
 | 9 | `ZeroAmount` | reachable (6 branch(es)) | `create_stream`, `create_streams`, `register_sponsor`, `sponsored_withdraw`, `top_up`, `withdraw`, `withdraw_treasury` | deposit_amount is zero or negative; withdraw amount is zero or negative; top-up amount is zero or negative; treasury withdrawal amount is zero or negative; a sponsor budget cap (per-period or per-beneficiary) is zero or negative; a sponsored claim requests a zero or negative payout |
 | 10 | `AmountExceedsAvailable` | reachable (2 branch(es)) | `sponsored_withdraw`, `withdraw` | amount exceeds the accrued-but-unwithdrawn balance; a sponsored claim exceeds the stream's accrued-but-unwithdrawn balance |
-| 11 | `MathOverflow` | reachable (6 branch(es)) | `available`, `cancel_stream`, `create_stream`, `sponsored_withdraw`, `streamed_at`, `top_up`, `withdraw`, `withdraw_max` | deposit + amount would overflow i128; deposit * duration would overflow u128; deposit * elapsed would overflow u128; withdrawn exceeds streamed (an invariant-violating stored stream); the cancel pro-rata split would underflow; withdrawn + amount would overflow i128 |
-| 12 | `NotAuthorized` | reachable (4 branch(es)) | `accept_ownership_transfer`, `cancel_ownership_transfer`, `cancel_stream`, `propose_ownership_transfer`, `propose_sender_transfer` | the caller is neither the sender nor the recipient; the caller is neither the current sender nor the current recipient; the caller is not the proposal's named new owner; the caller did not create the pending ownership proposal |
-| 13 | `NothingToWithdraw` | reachable (1 branch(es)) | `withdraw_max` | nothing has accrued yet, or everything accrued was already withdrawn |
+| 11 | `MathOverflow` | reachable (7 branch(es)) | `available`, `cancel_stream`, `create_stream`, `sponsored_withdraw`, `streamed_at`, `top_up`, `withdraw`, `withdraw_many`, `withdraw_max` | deposit + amount would overflow i128; deposit * duration would overflow u128; deposit * elapsed would overflow u128; withdrawn exceeds streamed (an invariant-violating stored stream); the cancel pro-rata split would underflow; withdrawn + amount would overflow i128; summing the batch's per-stream payouts into the summary total would overflow |
+| 12 | `NotAuthorized` | reachable (5 branch(es)) | `accept_ownership_transfer`, `cancel_ownership_transfer`, `cancel_stream`, `propose_ownership_transfer`, `propose_sender_transfer`, `withdraw_many` | the caller is neither the sender nor the recipient; the caller is neither the current sender nor the current recipient; the caller is not the proposal's named new owner; the caller did not create the pending ownership proposal; a stream in the batch belongs to a different recipient than the caller |
+| 13 | `NothingToWithdraw` | reachable (1 branch(es)) | `withdraw_many`, `withdraw_max` | nothing has accrued yet, or everything accrued was already withdrawn |
 | 14 | `FeeRateTooHigh` | reachable (1 branch(es)) | `set_fee_bps` | new_fee_bps exceeds MAX_FEE_BPS (the protocol cap) |
 | 15 | `NotGovernor` | reachable (2 branch(es)) | `accept_governor`, `cancel_upgrade`, `execute_upgrade`, `migrate_storage`, `nominate_governor`, `propose_upgrade`, `set_fee_bps`, `set_frozen`, `set_stream_policy`, `withdraw_treasury` | the caller is not the treasury governor; the caller is not the nominated governor |
 | 16 | `NoPendingGovernor` | reachable (1 branch(es)) | `accept_governor` | accept_governor with no nomination pending |
@@ -35,7 +35,7 @@ Every expected failure is a `StreamError` with a stable numeric code. This docum
 | 25 | `IntentNotExpired` | reachable (1 branch(es)) | `reclaim_expired` | the intent has not reached expires_at |
 | 26 | `DepositTransferFailed` | reachable (1 branch(es)) | `create_stream`, `create_streams` | the token refuses the deposit (+fee) pull (allowance, balance, or a non-compliant token) |
 | 27 | `TopUpTransferFailed` | reachable (1 branch(es)) | `top_up` | the token refuses the pull of the added funds |
-| 28 | `RecipientPayoutFailed` | reachable (1 branch(es)) | `cancel_stream`, `withdraw`, `withdraw_max` | the token refuses a payout to the recipient |
+| 28 | `RecipientPayoutFailed` | reachable (1 branch(es)) | `cancel_stream`, `withdraw`, `withdraw_many`, `withdraw_max` | the token refuses a payout to the recipient |
 | 29 | `SenderRefundFailed` | reachable (1 branch(es)) | `cancel_stream` | the token refuses the refund to the sender |
 | 30 | `TreasuryPayoutFailed` | reachable (1 branch(es)) | `withdraw_treasury` | the token refuses the payout of collected protocol fees |
 | 31 | `PolicyAssetNotAllowed` | reachable (1 branch(es)) | `create_stream`, `create_streams` | the asset is not permitted by the policy module allowlist |
@@ -43,7 +43,7 @@ Every expected failure is a `StreamError` with a stable numeric code. This docum
 | 33 | `PolicyNoQueuedChange` | reachable (1 branch(es)) | `policy_execute_asset` | no policy change is queued for the specified asset |
 | 34 | `PolicyNotInitialized` | reachable (1 branch(es)) | `policy_accept_handoff`, `policy_cancel_handoff`, `policy_execute_asset`, `policy_propose_asset`, `policy_propose_handoff`, `policy_set_timelock_delay` | the policy module has not been initialized |
 | 35 | `PolicyNoPendingHandoff` | reachable (1 branch(es)) | `policy_accept_handoff`, `policy_cancel_handoff` | no admin handoff proposal is pending |
-| 36 | `ContractFrozen` | reachable (1 branch(es)) | `accept_ownership_transfer`, `accept_sender_transfer`, `cancel_ownership_transfer`, `cancel_stream`, `create_stream`, `create_stream_with_refund`, `create_streams`, `expire_sender_transfer`, `migrate_stream_version`, `propose_ownership_transfer`, `propose_sender_transfer`, `set_refund_target`, `top_up`, `withdraw`, `withdraw_max` | the contract is frozen for maintenance or upgrade |
+| 36 | `ContractFrozen` | reachable (1 branch(es)) | `accept_ownership_transfer`, `accept_sender_transfer`, `cancel_ownership_transfer`, `cancel_stream`, `create_stream`, `create_stream_with_refund`, `create_streams`, `expire_sender_transfer`, `migrate_stream_version`, `propose_ownership_transfer`, `propose_sender_transfer`, `set_refund_target`, `top_up`, `withdraw`, `withdraw_many`, `withdraw_max` | the contract is frozen for maintenance or upgrade |
 | 37 | `ContractNotFrozen` | reachable (1 branch(es)) | `migrate_storage` | storage migration requires the contract to be frozen |
 | 38 | `NoPendingUpgrade` | reachable (2 branch(es)) | `cancel_upgrade`, `execute_upgrade` | execute_upgrade called with no upgrade pending; cancel_upgrade called with no upgrade pending |
 | 39 | `TimelockNotExpired` | reachable (1 branch(es)) | `execute_upgrade` | upgrade timelock delay has not yet expired |
@@ -71,7 +71,7 @@ Every expected failure is a `StreamError` with a stable numeric code. This docum
 | 61 | `OwnershipProposalExpired` | reachable (1 branch(es)) | `accept_ownership_transfer` | the proposal's acceptance window has elapsed |
 | 62 | `InvalidTransferTarget` | reachable (1 branch(es)) | `propose_ownership_transfer`, `propose_sender_transfer` | the proposed target already holds that role |
 | 63 | `OwnershipProposalPending` | reachable (1 branch(es)) | `propose_ownership_transfer` | an unexpired ownership proposal already exists for the stream |
-| 64 | `SchemaVersionUnsupported` | reachable (1 branch(es)) | `available`, `cancel_stream`, `get_stream`, `migrate_stream_version`, `sponsored_withdraw`, `stream_record_version`, `top_up`, `withdraw`, `withdraw_max` | the stored record carries a layout version this build does not understand |
+| 64 | `SchemaVersionUnsupported` | reachable (1 branch(es)) | `available`, `cancel_stream`, `get_stream`, `migrate_stream_version`, `sponsored_withdraw`, `stream_record_version`, `top_up`, `withdraw`, `withdraw_many`, `withdraw_max` | the stored record carries a layout version this build does not understand |
 | 65 | `SenderTransferNotFound` | reachable (1 branch(es)) | `accept_sender_transfer`, `expire_sender_transfer` | no sender-transfer proposal is stored for the stream |
 | 66 | `SenderTransferExpired` | reachable (1 branch(es)) | `accept_sender_transfer` | the sender transfer's acceptance window has elapsed |
 | 67 | `SenderTransferNotExpired` | reachable (1 branch(es)) | `expire_sender_transfer` | the sender transfer is still inside its acceptance window |
@@ -80,6 +80,9 @@ Every expected failure is a `StreamError` with a stable numeric code. This docum
 | 70 | `SenderTransferNotConsenter` | reachable (1 branch(es)) | `accept_sender_transfer` | the caller is not the stream's recipient |
 | 71 | `RefundTargetNotSender` | reachable (1 branch(es)) | `set_refund_target` | the caller is not the stream's current sender, so they do not own the deposit being routed |
 | 72 | `RefundTargetUnchanged` | reachable (1 branch(es)) | `create_stream_with_refund`, `set_refund_target` | the address already holds the refund claim, so routing to it changes nothing |
+| 73 | `WithdrawBatchEmpty` | reachable (1 branch(es)) | `withdraw_many` | the batch withdraw was requested with zero stream ids |
+| 74 | `WithdrawBatchTooLarge` | reachable (1 branch(es)) | `withdraw_many` | the batch withdraw exceeds MAX_WITHDRAW_BATCH stream ids |
+| 75 | `WithdrawDuplicateStreamIds` | reachable (1 branch(es)) | `withdraw_many` | the same stream id appears more than once in the batch |
 
 ## Branch matrix (entrypoint × condition → error)
 
@@ -91,18 +94,18 @@ Every expected failure is a `StreamError` with a stable numeric code. This docum
 | `CreateDurationTooLong` | `create_stream`, `create_streams` | `DurationTooLong` | 8 | duration exceeds MAX_DURATION_SECONDS (100 years) | reachable |
 | `WithdrawAmountNonPositive` | `withdraw` | `ZeroAmount` | 9 | withdraw amount is zero or negative | reachable |
 | `WithdrawAmountExceedsAvailable` | `withdraw` | `AmountExceedsAvailable` | 10 | amount exceeds the accrued-but-unwithdrawn balance | reachable |
-| `WithdrawMaxNothingToWithdraw` | `withdraw_max` | `NothingToWithdraw` | 13 | nothing has accrued yet, or everything accrued was already withdrawn | reachable |
+| `WithdrawMaxNothingToWithdraw` | `withdraw_max`, `withdraw_many` | `NothingToWithdraw` | 13 | nothing has accrued yet, or everything accrued was already withdrawn | reachable |
 | `CancelStreamNotCancellable` | `cancel_stream` | `StreamNotCancellable` | 4 | the recipient calls cancel_stream on a stream created non-cancelable | reachable |
 | `CancelStreamNotAuthorized` | `cancel_stream` | `NotAuthorized` | 12 | the caller is neither the sender nor the recipient | reachable |
 | `TopUpAmountNonPositive` | `top_up` | `ZeroAmount` | 9 | top-up amount is zero or negative | reachable |
 | `TopUpDepositOverflow` | `top_up` | `MathOverflow` | 11 | deposit + amount would overflow i128 | reachable |
-| `StreamNotFound` | `get_stream`, `available`, `withdraw`, `withdraw_max`, `cancel_stream`, `top_up`, `sponsored_withdraw`, `propose_ownership_transfer`, `accept_ownership_transfer`, `propose_sender_transfer`, `accept_sender_transfer`, `set_refund_target`, `stream_record_version`, `migrate_stream_version`, `refund_target`, `sender_history` | `StreamNotFound` | 1 | no stream is stored under the id | reachable |
-| `StreamNotActive` | `withdraw`, `withdraw_max`, `cancel_stream`, `top_up`, `sponsored_withdraw`, `propose_ownership_transfer`, `accept_ownership_transfer`, `propose_sender_transfer`, `accept_sender_transfer`, `set_refund_target` | `StreamNotActive` | 5 | the stream status is Cancelled or Depleted | reachable |
+| `StreamNotFound` | `get_stream`, `available`, `withdraw`, `withdraw_max`, `withdraw_many`, `cancel_stream`, `top_up`, `sponsored_withdraw`, `propose_ownership_transfer`, `accept_ownership_transfer`, `propose_sender_transfer`, `accept_sender_transfer`, `set_refund_target`, `stream_record_version`, `migrate_stream_version`, `refund_target`, `sender_history` | `StreamNotFound` | 1 | no stream is stored under the id | reachable |
+| `StreamNotActive` | `withdraw`, `withdraw_max`, `withdraw_many`, `cancel_stream`, `top_up`, `sponsored_withdraw`, `propose_ownership_transfer`, `accept_ownership_transfer`, `propose_sender_transfer`, `accept_sender_transfer`, `set_refund_target` | `StreamNotActive` | 5 | the stream status is Cancelled or Depleted | reachable |
 | `CapacityOverflow` | `create_stream`, `top_up` | `MathOverflow` | 11 | deposit * duration would overflow u128 | reachable |
-| `RateProductOverflow` | `streamed_at`, `available`, `withdraw`, `withdraw_max`, `cancel_stream`, `sponsored_withdraw` | `MathOverflow` | 11 | deposit * elapsed would overflow u128 | reachable |
-| `AvailableBalanceOverflow` | `available`, `withdraw`, `withdraw_max` | `MathOverflow` | 11 | withdrawn exceeds streamed (an invariant-violating stored stream) | defensive (unreachable) |
+| `RateProductOverflow` | `streamed_at`, `available`, `withdraw`, `withdraw_max`, `withdraw_many`, `cancel_stream`, `sponsored_withdraw` | `MathOverflow` | 11 | deposit * elapsed would overflow u128 | reachable |
+| `AvailableBalanceOverflow` | `available`, `withdraw`, `withdraw_max`, `withdraw_many` | `MathOverflow` | 11 | withdrawn exceeds streamed (an invariant-violating stored stream) | defensive (unreachable) |
 | `CancelSplitOverflow` | `cancel_stream` | `MathOverflow` | 11 | the cancel pro-rata split would underflow | defensive (unreachable) |
-| `PayoutOverflow` | `withdraw`, `withdraw_max`, `sponsored_withdraw` | `MathOverflow` | 11 | withdrawn + amount would overflow i128 | defensive (unreachable) |
+| `PayoutOverflow` | `withdraw`, `withdraw_max`, `withdraw_many`, `sponsored_withdraw` | `MathOverflow` | 11 | withdrawn + amount would overflow i128 | defensive (unreachable) |
 | `SetFeeRateTooHigh` | `set_fee_bps` | `FeeRateTooHigh` | 14 | new_fee_bps exceeds MAX_FEE_BPS (the protocol cap) | reachable |
 | `GovernorNotAllowed` | `set_fee_bps`, `nominate_governor`, `withdraw_treasury`, `set_frozen`, `propose_upgrade`, `cancel_upgrade`, `execute_upgrade`, `migrate_storage`, `set_stream_policy` | `NotGovernor` | 15 | the caller is not the treasury governor | reachable |
 | `AcceptGovernorNoPending` | `accept_governor` | `NoPendingGovernor` | 16 | accept_governor with no nomination pending | reachable |
@@ -129,7 +132,7 @@ Every expected failure is a `StreamError` with a stable numeric code. This docum
 | `IntentNotExpired` | `reclaim_expired` | `IntentNotExpired` | 25 | the intent has not reached expires_at | reachable |
 | `CreateDepositTransferFailed` | `create_stream`, `create_streams` | `DepositTransferFailed` | 26 | the token refuses the deposit (+fee) pull (allowance, balance, or a non-compliant token) | reachable |
 | `TopUpTransferFailed` | `top_up` | `TopUpTransferFailed` | 27 | the token refuses the pull of the added funds | reachable |
-| `RecipientPayoutFailed` | `withdraw`, `withdraw_max`, `cancel_stream` | `RecipientPayoutFailed` | 28 | the token refuses a payout to the recipient | reachable |
+| `RecipientPayoutFailed` | `withdraw`, `withdraw_max`, `withdraw_many`, `cancel_stream` | `RecipientPayoutFailed` | 28 | the token refuses a payout to the recipient | reachable |
 | `SenderRefundFailed` | `cancel_stream` | `SenderRefundFailed` | 29 | the token refuses the refund to the sender | reachable |
 | `TreasuryPayoutFailed` | `withdraw_treasury` | `TreasuryPayoutFailed` | 30 | the token refuses the payout of collected protocol fees | reachable |
 | `PolicyAssetNotAllowed` | `create_stream`, `create_streams` | `PolicyAssetNotAllowed` | 31 | the asset is not permitted by the policy module allowlist | reachable |
@@ -139,7 +142,7 @@ Every expected failure is a `StreamError` with a stable numeric code. This docum
 | `PolicyNoPendingHandoff` | `policy_accept_handoff`, `policy_cancel_handoff` | `PolicyNoPendingHandoff` | 35 | no admin handoff proposal is pending | reachable |
 | `CreateBatchEmpty` | `create_streams_batch` | `BatchEmpty` | 47 | entries is empty | reachable |
 | `CreateBatchTooLarge` | `create_streams_batch` | `BatchTooLarge` | 48 | entries length exceeds MAX_BATCH | reachable |
-| `ContractFrozen` | `create_stream`, `create_streams`, `withdraw`, `withdraw_max`, `cancel_stream`, `top_up`, `propose_ownership_transfer`, `accept_ownership_transfer`, `cancel_ownership_transfer`, `propose_sender_transfer`, `accept_sender_transfer`, `expire_sender_transfer`, `set_refund_target`, `create_stream_with_refund`, `migrate_stream_version` | `ContractFrozen` | 36 | the contract is frozen for maintenance or upgrade | reachable |
+| `ContractFrozen` | `create_stream`, `create_streams`, `withdraw`, `withdraw_max`, `withdraw_many`, `cancel_stream`, `top_up`, `propose_ownership_transfer`, `accept_ownership_transfer`, `cancel_ownership_transfer`, `propose_sender_transfer`, `accept_sender_transfer`, `expire_sender_transfer`, `set_refund_target`, `create_stream_with_refund`, `migrate_stream_version` | `ContractFrozen` | 36 | the contract is frozen for maintenance or upgrade | reachable |
 | `MigrationNotFrozen` | `migrate_storage` | `ContractNotFrozen` | 37 | storage migration requires the contract to be frozen | reachable |
 | `ExecuteUpgradeNoPending` | `execute_upgrade` | `NoPendingUpgrade` | 38 | execute_upgrade called with no upgrade pending | reachable |
 | `CancelUpgradeNoPending` | `cancel_upgrade` | `NoPendingUpgrade` | 38 | cancel_upgrade called with no upgrade pending | reachable |
@@ -162,7 +165,7 @@ Every expected failure is a `StreamError` with a stable numeric code. This docum
 | `OwnershipProposalExpired` | `accept_ownership_transfer` | `OwnershipProposalExpired` | 61 | the proposal's acceptance window has elapsed | reachable |
 | `NoPendingOwnership` | `accept_ownership_transfer`, `cancel_ownership_transfer` | `NoPendingOwnership` | 60 | no ownership proposal is stored for the stream | reachable |
 | `CancelProposalNotProposer` | `cancel_ownership_transfer` | `NotAuthorized` | 12 | the caller did not create the pending ownership proposal | reachable |
-| `SchemaVersionUnsupported` | `get_stream`, `available`, `withdraw`, `withdraw_max`, `cancel_stream`, `top_up`, `sponsored_withdraw`, `stream_record_version`, `migrate_stream_version` | `SchemaVersionUnsupported` | 64 | the stored record carries a layout version this build does not understand | reachable |
+| `SchemaVersionUnsupported` | `get_stream`, `available`, `withdraw`, `withdraw_max`, `withdraw_many`, `cancel_stream`, `top_up`, `sponsored_withdraw`, `stream_record_version`, `migrate_stream_version` | `SchemaVersionUnsupported` | 64 | the stored record carries a layout version this build does not understand | reachable |
 | `SenderTransferNotFound` | `accept_sender_transfer`, `expire_sender_transfer` | `SenderTransferNotFound` | 65 | no sender-transfer proposal is stored for the stream | reachable |
 | `SenderTransferExpired` | `accept_sender_transfer` | `SenderTransferExpired` | 66 | the sender transfer's acceptance window has elapsed | reachable |
 | `SenderTransferNotExpired` | `expire_sender_transfer` | `SenderTransferNotExpired` | 67 | the sender transfer is still inside its acceptance window | reachable |
@@ -171,6 +174,11 @@ Every expected failure is a `StreamError` with a stable numeric code. This docum
 | `SenderTransferNotConsenter` | `accept_sender_transfer` | `SenderTransferNotConsenter` | 70 | the caller is not the stream's recipient | reachable |
 | `RefundTargetNotSender` | `set_refund_target` | `RefundTargetNotSender` | 71 | the caller is not the stream's current sender, so they do not own the deposit being routed | reachable |
 | `RefundTargetUnchanged` | `create_stream_with_refund`, `set_refund_target` | `RefundTargetUnchanged` | 72 | the address already holds the refund claim, so routing to it changes nothing | reachable |
+| `WithdrawManyEmpty` | `withdraw_many` | `WithdrawBatchEmpty` | 73 | the batch withdraw was requested with zero stream ids | reachable |
+| `WithdrawManyTooLarge` | `withdraw_many` | `WithdrawBatchTooLarge` | 74 | the batch withdraw exceeds MAX_WITHDRAW_BATCH stream ids | reachable |
+| `WithdrawManyDuplicateIds` | `withdraw_many` | `WithdrawDuplicateStreamIds` | 75 | the same stream id appears more than once in the batch | reachable |
+| `WithdrawManyNotStreamRecipient` | `withdraw_many` | `NotAuthorized` | 12 | a stream in the batch belongs to a different recipient than the caller | reachable |
+| `WithdrawManyTotalOverflow` | `withdraw_many` | `MathOverflow` | 11 | summing the batch's per-stream payouts into the summary total would overflow | defensive (unreachable) |
 
 ## Retired codes
 
@@ -183,4 +191,4 @@ Codes are append-only: a retired code is never renumbered, reused, or removed �
 
 ## Defensive branches
 
-A defensive branch is a `checked_*` guard whose precondition the contract's invariants rule out for any stored stream. It has a code (so it is not a dead *code*) but cannot be triggered; the matrix test asserts it never fires: `AvailableBalanceOverflow`, `CancelSplitOverflow`, `PayoutOverflow`.
+A defensive branch is a `checked_*` guard whose precondition the contract's invariants rule out for any stored stream. It has a code (so it is not a dead *code*) but cannot be triggered; the matrix test asserts it never fires: `AvailableBalanceOverflow`, `CancelSplitOverflow`, `PayoutOverflow`, `WithdrawManyTotalOverflow`.

@@ -97,11 +97,11 @@ use surface::Branch;
 
 pub use errors::StreamError;
 pub use events::{
-    BeneficiaryEnrolled, ContractFrozenStateChanged, ContractUpgraded, FeeCharged, FeeWithdrawn,
-    OperatorKeyRotated, OracleConfigUpdated, OracleStaleFallback, OracleTimeReported,
-    OwnershipAccepted, OwnershipProposed, PolicyAssetExecuted, PolicyAssetQueued,
-    PolicyHandoffAccepted, PolicyHandoffCancelled, PolicyHandoffProposed, PolicyInitialized,
-    ScheduledIntentCancelled, ScheduledIntentExpired, ScheduledStreamExecuted,
+    BatchWithdrawSummary, BeneficiaryEnrolled, ContractFrozenStateChanged, ContractUpgraded,
+    FeeCharged, FeeWithdrawn, OperatorKeyRotated, OracleConfigUpdated, OracleStaleFallback,
+    OracleTimeReported, OwnershipAccepted, OwnershipProposed, PolicyAssetExecuted,
+    PolicyAssetQueued, PolicyHandoffAccepted, PolicyHandoffCancelled, PolicyHandoffProposed,
+    PolicyInitialized, ScheduledIntentCancelled, ScheduledIntentExpired, ScheduledStreamExecuted,
     SenderTransferExpired, SenderTransferProposed, SenderTransferred, SponsorActiveSet,
     SponsorClaim, SponsorRegistered, StorageMigrated, StreamCancelled, StreamCreated,
     StreamPolicySet, StreamRecordMigrated, StreamRefundTargetChanged, StreamScheduled,
@@ -116,10 +116,11 @@ pub use sponsor::{PeriodSpend, SponsorConfig};
 pub use stream::{
     streamed_at, BatchEntry, MigrationStatus, OwnershipRole, PendingOwnership,
     PendingSenderTransfer, PendingUpgrade, SenderHistory, SenderTransferRecord, Stream,
-    StreamStatus, StreamVersionReport, VersionedStream, CURRENT_STREAM_RECORD_VERSION,
-    INITIAL_SCHEMA_VERSION, MAX_BATCH, MAX_DURATION_SECONDS, MAX_MIGRATION_BATCH_SIZE,
-    MAX_PAGE_SIZE, MIN_BATCH, MIN_UPGRADE_DELAY_SECONDS, OWNERSHIP_PROPOSAL_TTL_SECONDS,
-    STREAM_RECORD_VERSION_V1, STREAM_RECORD_VERSION_V2, TARGET_SCHEMA_VERSION,
+    StreamStatus, StreamVersionReport, VersionedStream, WithdrawEntry, WithdrawOutcome,
+    CURRENT_STREAM_RECORD_VERSION, INITIAL_SCHEMA_VERSION, MAX_BATCH, MAX_DURATION_SECONDS,
+    MAX_MIGRATION_BATCH_SIZE, MAX_PAGE_SIZE, MAX_WITHDRAW_BATCH, MIN_BATCH,
+    MIN_UPGRADE_DELAY_SECONDS, OWNERSHIP_PROPOSAL_TTL_SECONDS, STREAM_RECORD_VERSION_V1,
+    STREAM_RECORD_VERSION_V2, TARGET_SCHEMA_VERSION,
 };
 pub use treasury::{fee_amount, FeeScan, Treasury, TreasuryStatus, BPS_DENOMINATOR, MAX_FEE_BPS};
 
@@ -911,15 +912,167 @@ impl StreamingPayments {
     pub fn withdraw_max(env: Env, stream_id: u64) -> Result<i128, StreamError> {
         Self::require_not_frozen(&env)?;
         let mut s = Self::authorize_withdrawal(&env, stream_id)?;
+        Self::settle_accrued(&env, &mut s)
+    }
 
-        let resolved = oracle::resolve_stream_time(&env, stream_id, s.use_oracle);
-        let amount = stream::available_amount_at(&s, resolved.timestamp)?;
+    /// Claims the entire accrued balance of up to [`MAX_WITHDRAW_BATCH`] streams
+    /// in one transaction, through the exact single-stream claim path.
+    ///
+    /// Every entry runs [`Self::settle_accrued`] — the same function
+    /// `withdraw_max` uses — so the batch inherits the CEI ordering, accrual
+    /// math, TTL extension and per-stream [`Withdrawn`] event of the audited
+    /// single path instead of restating any of it. One authorization covers the
+    /// batch: the caller must be the recipient of *every* stream listed, so a
+    /// holder can never claim a counterparty's stream by adding its id
+    /// (rejected per-entry with [`StreamError::NotAuthorized`]).
+    ///
+    /// **Per-entry isolation.** A stream that fails a pre-payout check — not
+    /// found, not yours, not active, nothing accrued, overflow — comes back as a
+    /// [`WithdrawEntry`] carrying that error's code and `amount: 0`, and is
+    /// *skipped*: its siblings still pay out. Payout failures are the deliberate
+    /// exception:
+    /// [`StreamError::RecipientPayoutFailed`] aborts the whole call, because
+    /// the effects of a claim (the `withdrawn` update, the `Withdrawn` event)
+    /// are written *before* the token interaction, as CEI requires, and a
+    /// published event cannot be un-published. Skipping a failed payout would
+    /// therefore mean un-writing state after an external call — the exact
+    /// reentrancy hazard the ordering exists to prevent. Aborting instead lets
+    /// the host roll the transaction back as if it never ran.
+    ///
+    /// **`strict`.** `false` (the default behaviour) keeps partial success: the
+    /// call settles what it can and reports the rest. `true` turns any
+    /// per-entry rejection into a revert of the whole call, returning that
+    /// error, so an all-or-nothing claim either settles every stream or none.
+    ///
+    /// The call reverts before reading any state when `stream_ids` is empty
+    /// ([`StreamError::WithdrawBatchEmpty`]), longer than
+    /// [`MAX_WITHDRAW_BATCH`] ([`StreamError::WithdrawBatchTooLarge`]), or
+    /// contains a repeated id ([`StreamError::WithdrawDuplicateStreamIds`]) —
+    /// a duplicate would otherwise claim against state its first occurrence has
+    /// already rewritten.
+    pub fn withdraw_many(
+        env: Env,
+        recipient: Address,
+        stream_ids: Vec<u64>,
+        strict: bool,
+    ) -> Result<Vec<WithdrawEntry>, StreamError> {
+        let count = stream_ids.len();
+        if count == 0 {
+            return Err(surface::reject(Branch::WithdrawManyEmpty));
+        }
+        if count > stream::MAX_WITHDRAW_BATCH {
+            return Err(surface::reject(Branch::WithdrawManyTooLarge));
+        }
+        let mut seen = Vec::new(&env);
+        for id in stream_ids.iter() {
+            if seen.contains(id) {
+                return Err(surface::reject(Branch::WithdrawManyDuplicateIds));
+            }
+            seen.push_back(id);
+        }
+
+        Self::require_not_frozen(&env)?;
+        recipient.require_auth();
+
+        let mut entries = Vec::new(&env);
+        let mut paid = Vec::new(&env);
+        let mut total: i128 = 0;
+        let mut skipped: u32 = 0;
+        for id in stream_ids.iter() {
+            let result = Self::authorize_batch_withdrawal(&env, id, &recipient)
+                .and_then(|mut s| Self::settle_accrued(&env, &mut s));
+            if strict {
+                // Any per-entry rejection aborts the batch, so the entries that
+                // already settled are rolled back with it.
+                if let Err(error) = &result {
+                    return Err(*error);
+                }
+            } else if result == Err(StreamError::RecipientPayoutFailed) {
+                // The one error that cannot be reported per entry. This entry's
+                // effects — the `withdrawn` update and the `Withdrawn` event —
+                // were written before the token was called, as CEI requires,
+                // and neither can be un-written nor un-published for a single
+                // entry. Reporting it as a skip would leave the ledger claiming
+                // that money left when nothing moved, so the whole call
+                // reverts and the host discards every entry's effects instead.
+                return Err(StreamError::RecipientPayoutFailed);
+            }
+            let entry = match result {
+                Ok(amount) => {
+                    total = total
+                        .checked_add(amount)
+                        .ok_or_else(|| surface::reject(Branch::WithdrawManyTotalOverflow))?;
+                    paid.push_back(WithdrawOutcome {
+                        stream_id: id,
+                        amount,
+                    });
+                    WithdrawEntry {
+                        stream_id: id,
+                        amount,
+                        code: 0,
+                    }
+                }
+                Err(error) => {
+                    skipped += 1;
+                    WithdrawEntry {
+                        stream_id: id,
+                        amount: 0,
+                        code: error.code(),
+                    }
+                }
+            };
+            entries.push_back(entry);
+        }
+
+        #[cfg(test)]
+        cei_trace::record("event BatchWithdrawSummary");
+        BatchWithdrawSummary {
+            settled: paid.clone(),
+            total,
+            requested: count,
+            skipped,
+            recipient,
+        }
+        .publish(&env);
+
+        Ok(entries)
+    }
+
+    /// Shared claim tail for `withdraw_max` and every `withdraw_many` entry:
+    /// resolve the stream's clock, take the whole accrued-but-unwithdrawn
+    /// balance, and pay it out. Takes the already-authorized stream so the two
+    /// entrypoints differ only in how they authorize.
+    fn settle_accrued(env: &Env, s: &mut Stream) -> Result<i128, StreamError> {
+        let resolved = oracle::resolve_stream_time(env, s.id, s.use_oracle);
+        let amount = stream::available_amount_at(s, resolved.timestamp)?;
         if amount <= 0 {
             return Err(surface::reject(Branch::WithdrawMaxNothingToWithdraw));
         }
 
-        Self::pay_out(&env, &mut s, amount)?;
+        Self::pay_out(env, s, amount)?;
         Ok(amount)
+    }
+
+    /// Batch-mode authorization: the stream must exist, belong to the batch
+    /// caller, and be active.
+    ///
+    /// The identity check runs *before* any authorization is required, because
+    /// a `require_auth` failure for a stranger's recipient aborts the whole
+    /// transaction rather than producing a per-entry error — the batch could
+    /// not report the offending entry if it got that far.
+    fn authorize_batch_withdrawal(
+        env: &Env,
+        stream_id: u64,
+        recipient: &Address,
+    ) -> Result<Stream, StreamError> {
+        let s = stream::get_stream(env, stream_id)?;
+        if &s.recipient != recipient {
+            return Err(surface::reject(Branch::WithdrawManyNotStreamRecipient));
+        }
+        if s.status != StreamStatus::Active {
+            return Err(surface::reject(Branch::StreamNotActive));
+        }
+        Ok(s)
     }
 
     /// Shared preamble for both withdrawal paths: load the stream, require

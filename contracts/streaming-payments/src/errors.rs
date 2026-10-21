@@ -219,6 +219,20 @@ pub enum StreamError {
     /// would rewrite the same address and emit an event that reports no
     /// change. Rejected so the log only ever records real routing changes.
     RefundTargetUnchanged = 72,
+    /// `withdraw_many` was called with an empty list of stream ids. Rejected
+    /// as its own code rather than `BatchEmpty` (47), which is documented as a
+    /// *creation* batch precondition, so callers can tell the two apart.
+    WithdrawBatchEmpty = 73,
+    /// `withdraw_many` was called with more stream ids than
+    /// `MAX_WITHDRAW_BATCH`. The cap is what keeps a single claim call inside
+    /// the transaction budget; split larger sets across several calls.
+    WithdrawBatchTooLarge = 74,
+    /// `withdraw_many` was given the same stream id more than once. The second
+    /// entry would claim against state the first entry already mutated (and,
+    /// for `withdraw_max`-style amounts, would silently double-count the
+    /// available balance), so the whole call is rejected instead of
+    /// de-duplicated.
+    WithdrawDuplicateStreamIds = 75,
 }
 
 impl StreamError {
@@ -298,6 +312,9 @@ impl StreamError {
         StreamError::SenderTransferNotConsenter,
         StreamError::RefundTargetNotSender,
         StreamError::RefundTargetUnchanged,
+        StreamError::WithdrawBatchEmpty,
+        StreamError::WithdrawBatchTooLarge,
+        StreamError::WithdrawDuplicateStreamIds,
     ];
 
     /// The stable numeric value carried across the contract boundary

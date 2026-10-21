@@ -1,11 +1,12 @@
 //! Events emitted by StreamPay.
 //!
 //! Per-stream events are keyed by `stream_id`; `StreamsCreated` is keyed by
-//! sender and carries the batch ids. Non-topic fields are event data.
+//! sender and carries the batch ids, and `BatchWithdrawSummary` is keyed by the
+//! recipient of a `withdraw_many` call. Non-topic fields are event data.
 
 use soroban_sdk::{contractevent, Address, BytesN, Vec};
 
-use crate::stream::OwnershipRole;
+use crate::stream::{OwnershipRole, WithdrawOutcome};
 
 /// Emitted when a new stream is created and its deposit pulled in.
 #[contractevent]
@@ -41,6 +42,26 @@ pub struct Withdrawn {
     pub amount: i128,
     /// Total withdrawn from the stream after this withdrawal.
     pub withdrawn_total: i128,
+}
+
+/// Emitted once after a `withdraw_many` batch settles, alongside the
+/// per-stream [`Withdrawn`] events. The per-stream shape is unchanged so
+/// existing consumers keep working; this event is the batch-level view: every
+/// entry that paid, the total, and how many of the requested ids were skipped.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchWithdrawSummary {
+    #[topic]
+    pub recipient: Address,
+    /// Entries that settled, in request order. A skipped entry appears only in
+    /// the entrypoint's return value, never here — nothing was paid for it.
+    pub settled: Vec<WithdrawOutcome>,
+    /// Sum of the delivered amounts: the total the recipient received.
+    pub total: i128,
+    /// Ids the caller asked for.
+    pub requested: u32,
+    /// `requested - settled.len()`: entries skipped with a per-entry error.
+    pub skipped: u32,
 }
 
 /// Emitted when a stream is cancelled. The recipient's accrued balance and

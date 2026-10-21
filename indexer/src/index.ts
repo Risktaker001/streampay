@@ -357,7 +357,23 @@ export async function run(): Promise<void> {
   });
   outboxDispatcher.start();
 
-  const eventNames = ["stream_created", "withdrawn", "stream_cancelled", "stream_topped_up", "stream_paused", "stream_resumed"];
+  // `stream_refund_target_changed` (#204) is projected into `streams.refund_target`
+  // by the store, so it has to be fetched for that column to ever be filled.
+  // `batch_withdraw_summary` (#205) names no single stream — it is keyed by the
+  // recipient and covers the whole `withdraw_many` call. The per-stream
+  // `withdrawn` events the same call publishes remain the authoritative source
+  // for the projections, so subscribing to the summary adds the batch record to
+  // the journal without touching any row.
+  const eventNames = [
+    "stream_created",
+    "withdrawn",
+    "stream_cancelled",
+    "stream_topped_up",
+    "stream_paused",
+    "stream_resumed",
+    "stream_refund_target_changed",
+    "batch_withdraw_summary",
+  ];
   const topicFilters = eventNames.map((name) => [nativeToScVal(name, { type: "symbol" }).toXDR("base64")]);
 
   // ── Parallel ledger-window ingestion (issue #117) ──────────────────────────

@@ -73,6 +73,7 @@ Metrics, alerting stack, and operational diagnosis: [`docs/RUNBOOK.md`](./docs/R
 | `create_streams(sender, inputs: Vec<StreamInput>) → Vec<u64>` | anyone (sender auth required) | one pull per token | `StreamsCreated`; `FeeCharged` per charged stream |
 | `withdraw(stream_id, amount)` | recipient | pays out ≤ accrued | `Withdrawn` |
 | `withdraw_max(stream_id) → i128` | recipient | pays out all accrued, atomically | `Withdrawn` |
+| `withdraw_many(recipient, stream_ids: Vec<u64>, strict) → Vec<WithdrawEntry>` | recipient of every listed stream | pays out each settled stream's accrued balance, in one transaction | `Withdrawn` per settled stream; `BatchWithdrawSummary` |
 | `cancel_stream(caller, stream_id)` | sender; recipient iff `cancelable` | pro-rata split, atomic | `StreamCancelled` |
 | `top_up(stream_id, amount)` | sender | pulls added funds | `StreamToppedUp` |
 | `propose_ownership_transfer(caller, stream_id, new_owner)` | sender or recipient | — (records a pending target) | `OwnershipProposed` |
@@ -124,6 +125,31 @@ individual `StreamCreated` events; fee-enabled batches still emit one
 `FeeCharged` event per charged stream to preserve treasury auditability — see
 [Protocol fees](#protocol-fees-optional) below. Soroban transaction resource
 limits bound the practical maximum batch size.
+
+`withdraw_many(recipient, stream_ids, strict)` (#205) settles up to
+`MAX_WITHDRAW_BATCH = 20` streams in one transaction and answers with one entry
+per requested id, in request order: `{ stream_id, amount, code: 0 }` for a stream
+that paid, `{ stream_id, amount: 0, code }` for one it skipped. The code is the
+numeric `StreamError` discriminant rather than an error *value* on purpose —
+`scValToNative` cannot convert a ScVal carrying an `ScError`, so a `Result` in
+that vector would make a batch with one skipped stream undecodable off-chain.
+Every entry runs the same code path as `withdraw_max` — the same accrual math,
+TTL extension and `Withdrawn` event — so partial success is the default and one
+exhausted stream no longer blocks the other nineteen. `strict` promotes any
+per-entry rejection into a revert of the whole call. Three bounds are checked
+before any state is read: an empty list (`WithdrawBatchEmpty`, 73), a list over
+the cap (`WithdrawBatchTooLarge`, 74) and a repeated id
+(`WithdrawDuplicateStreamIds`, 75) each revert the call outright, because a
+second entry for an id would claim against state its first entry had already
+rewritten. A per-entry `code` is one of the pre-payout rejections the
+single-stream path returns — the stream is unknown, not yours, not active, or has
+nothing accrued — and that entry pays nothing. A refused *payout* is the one
+failure that aborts the batch instead of skipping an entry: its `withdrawn`
+update and `Withdrawn` event were written before the token was called, as CEI
+requires, and neither can be un-written for a single entry, so the transaction
+reverts whole. Batching is cheaper as well as shorter: 20 claims in one call
+measured 6.27M CPU against 7.99M for the same 20 claims as 20 transactions
+([`docs/FOOTPRINT.md`](./docs/FOOTPRINT.md) §4.1).
 
 `recipient_streams` / `sender_streams` are on-chain discovery indexes:
 append-only, creation-ordered stream-id lists per address, paginated

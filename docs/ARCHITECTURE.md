@@ -471,8 +471,11 @@ griefing) is in [`SCHEDULED_INTENTS.md`](./SCHEDULED_INTENTS.md).
   dead and no branch uncoded. `docs/ERROR_SURFACE.md` is generated from the same table
   and diffed in CI.
 - **`withdraw_max`** shares the `withdraw` payout tail (`pay_out`) so both
-  paths inherit the same CEI ordering and reentrancy proof; index pagination
-  and TTL behavior have dedicated tests in `test.rs`.
+  paths inherit the same CEI ordering and reentrancy proof; `withdraw_many`
+  (#205) runs that same tail once per requested id, so a batch claim differs
+  from twenty single claims only in its per-transaction overhead, never in
+  accrual math or event shape. Index pagination and TTL behavior have dedicated
+  tests in `test.rs`.
 - **Ownership transfer** tests cover propose → accept for both roles,
   propose → cancel → re-propose, expiry at the exact seven-day boundary
   (including lazy replacement and explicit cancellation), rejection of
@@ -849,6 +852,7 @@ Events are the off-chain ledger indexers consume; fields decode by position
 |---|---|---|
 | `StreamCreated` | `stream_id: u64` | `sender`, `recipient`, `token: Address`; `deposit: i128`; `start_time`, `end_time: u64`; `cancelable: bool` |
 | `Withdrawn` | `stream_id: u64` | `recipient: Address`; `amount: i128`; `withdrawn_total: i128` |
+| `BatchWithdrawSummary` | `recipient: Address` | `settled: Vec<WithdrawOutcome>` (each `stream_id: u64`; `amount: i128`); `total: i128`; `requested: u32`; `skipped: u32` |
 | `StreamCancelled` | `stream_id: u64` | `cancelled_by: Address`; `recipient_amount: i128`; `sender_amount: i128` |
 | `StreamToppedUp` | `stream_id: u64` | `sender: Address`; `amount: i128`; `new_deposit: i128` |
 | `FeeCharged` | `stream_id: u64` | `token: Address`; `payer: Address`; `amount: i128`; `fee_bps: u32` |

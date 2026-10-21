@@ -155,6 +155,16 @@ contributor:
   appending, storage grows by at most one address per *routed stream*, not per
   routed amendment — the append-only growth claim is bounded by streams, and an
   unrouted stream stores nothing at all.
+- **Batch claiming (#205).** `withdraw_many` settles each id through the same
+  `settle_accrued` helper `withdraw_max` uses, so the per-entry work — record
+  read, oracle resolution, rewrite, `Withdrawn` event, token transfer — is
+  identical by construction. What the batch removes is the *per-transaction*
+  work: one contract invocation, one `ContractFrozen` instance read, one
+  `require_auth` for the whole batch, and one ledger footprint instead of
+  twenty. The batch also adds work no single claim pays: the duplicate scan, the
+  per-entry outcome vector, and the `BatchWithdrawSummary` event. Measured over
+  the full cap of 20 streams, the additions cost less than the overhead they
+  remove — see the table below.
 - **Storage growth is append-only and bounded per stream:** at most three extra
   keys exist for a stream that has been through the sender-transfer surface
   (`PendingSenderTransfer`, `RefundTarget`, `SenderHistory`), and each is under
@@ -171,6 +181,46 @@ Re-measured with `cargo test -p streampay-contract --lib hot_path_footprint
 | `withdraw_max` | 347,710 | 138,764 | +9,047 (+2.67%) |
 | `cancel_stream` | 552,355 | 181,145 | +28,792 (+5.50%) |
 | `set_refund_target` | 140,812 | 68,410 | new path (#204), budget 160,000 |
+
+### 4.1 Batch claim vs. the same claims issued separately (#205)
+
+`withdraw_many_footprint_harness` builds one portfolio of
+`MAX_WITHDRAW_BATCH` = 20 fully accrued streams twice, over two identical
+fixtures, and claims it in both ways. `cost_estimate()` reports the budget of the
+*last* host invocation rather than a running total, so the twenty separate
+claims are measured one call at a time and summed — that sum is what a recipient
+without batching actually pays. The row below labelled "one stream" is the last
+of those individual measurements, which the harness prints as
+`withdraw_max cpu=… mem=…`; the later claims in the loop are the most expensive
+ones, because every claim grows the recipient's own index the next claim reads.
+
+| Path | CPU Instructions | Memory (Bytes) |
+|---|---:|---:|
+| `withdraw_max`, one stream (last measured) | 415,715 | 164,468 |
+| `withdraw_max` × 20 (20 transactions, summed) | 7,994,622 | 3,213,764 |
+| `withdraw_many` (20 ids, 1 transaction) | **6,265,726** | **1,669,350** |
+| Saved by batching | 1,728,896 (−21.6%) | 1,544,414 (−48.1%) |
+
+Per entry the batch pays 313,286 CPU against a 399,731 CPU average single
+(7,994,622 / 20), so the −21.6% saving is the same ratio read either way, and
+memory halves because one transaction carries one contract instance, one
+authorization and one footprint instead of twenty of each. The harness asserts
+both that the batch is cheaper than the summed twenty singles and that it is
+cheaper than twenty times the single claim it replaces, so a future change cannot
+quietly make the batch path pay more per entry than the loop it optimizes.
+
+These numbers are *not* comparable with the §4 table's `withdraw_max` row
+(347,710 CPU / 138,764 B). That one claims a 30-day stream in a fixture that has
+already run `create_stream`, `withdraw` and `cancel_stream` in the same env; this
+one claims twenty 1-day streams in a fixture built for the comparison. Only the
+ratios inside each table are meaningful.
+
+Two numbers put the cap in context: a full 20-stream batch runs at 6.27M CPU
+against Soroban's 100M-instruction per-transaction ceiling, and the harness
+budgets it at 8,000,000 CPU. The remaining ~5.5M of headroom is the caller's own
+footprint, rent, and the transaction envelope — which is why the cap is 20 and
+not the 25 `create_streams_batch` allows: creation entries do not read a record,
+resolve an oracle, rewrite it, emit two events and transfer tokens.
 
 `cancel_stream` is the only path that pays both effects; the rest of the delta
 is the record envelope. Its harness budget was raised from 540,000 to
@@ -208,3 +258,6 @@ above so the next change to a hot path is measured, not estimated.
      - `withdraw` <= 360,000 CPU
      - `cancel_stream` <= 540,000 CPU
      - `withdraw_max` <= 350,000 CPU
+   - `withdraw_many_footprint_harness` measures §4.1 and asserts that a
+     full 20-id batch stays under 8,000,000 CPU and costs less than the same
+     twenty claims issued as separate transactions.

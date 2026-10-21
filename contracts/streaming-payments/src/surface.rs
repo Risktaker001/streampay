@@ -224,13 +224,29 @@ pub enum Branch {
     /// `create_stream_with_refund` / `set_refund_target`: the address already
     /// holds the refund claim, so the routing changes nothing.
     RefundTargetUnchanged,
+    // ------------------------------------------------ batch withdraw (#205)
+    /// `withdraw_many`: the id vector is empty. Rejected with its own code
+    /// rather than the creation-batch `BatchEmpty` so clients can tell which
+    /// batch API they mis-called.
+    WithdrawManyEmpty,
+    /// `withdraw_many`: the id vector exceeds `MAX_WITHDRAW_BATCH`.
+    WithdrawManyTooLarge,
+    /// `withdraw_many`: the same stream id appears more than once, so the
+    /// second entry would claim against state the first one already rewrote.
+    WithdrawManyDuplicateIds,
+    /// `withdraw_many`: an entry belongs to a recipient other than the caller.
+    /// One holder can never claim another's stream through a batch.
+    WithdrawManyNotStreamRecipient,
+    /// `withdraw_many`: summing the per-entry amounts into the summary's
+    /// `total` would overflow `i128`.
+    WithdrawManyTotalOverflow,
 }
 
 impl Branch {
     /// Every branch, in declaration order. The matrix test walks this list and
     /// the coverage test requires each [`StreamError`] variant to be produced by
     /// one of these (or retired).
-    pub const ALL: [Branch; 86] = [
+    pub const ALL: [Branch; 91] = [
         Branch::CreateDepositNonPositive,
         Branch::CreateStartTimeInPast,
         Branch::CreateInvalidTimeRange,
@@ -317,6 +333,11 @@ impl Branch {
         Branch::SenderTransferNotConsenter,
         Branch::RefundTargetNotSender,
         Branch::RefundTargetUnchanged,
+        Branch::WithdrawManyEmpty,
+        Branch::WithdrawManyTooLarge,
+        Branch::WithdrawManyDuplicateIds,
+        Branch::WithdrawManyNotStreamRecipient,
+        Branch::WithdrawManyTotalOverflow,
     ];
 
     /// The entrypoint(s) through which this branch can fire. Shared helpers
@@ -332,7 +353,12 @@ impl Branch {
             Branch::WithdrawAmountNonPositive | Branch::WithdrawAmountExceedsAvailable => {
                 &["withdraw"]
             }
-            Branch::WithdrawMaxNothingToWithdraw => &["withdraw_max"],
+            Branch::WithdrawMaxNothingToWithdraw => &["withdraw_max", "withdraw_many"],
+            Branch::WithdrawManyEmpty
+            | Branch::WithdrawManyTooLarge
+            | Branch::WithdrawManyDuplicateIds => &["withdraw_many"],
+            Branch::WithdrawManyNotStreamRecipient => &["withdraw_many"],
+            Branch::WithdrawManyTotalOverflow => &["withdraw_many"],
             Branch::CancelStreamNotCancellable | Branch::CancelStreamNotAuthorized => {
                 &["cancel_stream"]
             }
@@ -342,6 +368,7 @@ impl Branch {
                 "available",
                 "withdraw",
                 "withdraw_max",
+                "withdraw_many",
                 "cancel_stream",
                 "top_up",
                 "sponsored_withdraw",
@@ -358,6 +385,7 @@ impl Branch {
             Branch::StreamNotActive => &[
                 "withdraw",
                 "withdraw_max",
+                "withdraw_many",
                 "cancel_stream",
                 "top_up",
                 "sponsored_withdraw",
@@ -373,10 +401,13 @@ impl Branch {
                 "available",
                 "withdraw",
                 "withdraw_max",
+                "withdraw_many",
                 "cancel_stream",
                 "sponsored_withdraw",
             ],
-            Branch::AvailableBalanceOverflow => &["available", "withdraw", "withdraw_max"],
+            Branch::AvailableBalanceOverflow => {
+                &["available", "withdraw", "withdraw_max", "withdraw_many"]
+            }
             Branch::CancelSplitOverflow => &["cancel_stream"],
             Branch::SetFeeRateTooHigh => &["set_fee_bps"],
             Branch::GovernorNotAllowed => &[
@@ -396,7 +427,12 @@ impl Branch {
             Branch::WithdrawTreasuryAmountNonPositive | Branch::WithdrawTreasuryExceedsBalance => {
                 &["withdraw_treasury"]
             }
-            Branch::PayoutOverflow => &["withdraw", "withdraw_max", "sponsored_withdraw"],
+            Branch::PayoutOverflow => &[
+                "withdraw",
+                "withdraw_max",
+                "withdraw_many",
+                "sponsored_withdraw",
+            ],
             // ----------------------------------------------------- sponsor module
             Branch::RegisterLimitNonPositive => &["register_sponsor"],
             Branch::SponsoredWithdrawAmountNonPositive
@@ -425,7 +461,9 @@ impl Branch {
             Branch::IntentNotExpired => &["reclaim_expired"],
             Branch::CreateDepositTransferFailed => &["create_stream", "create_streams"],
             Branch::TopUpTransferFailed => &["top_up"],
-            Branch::RecipientPayoutFailed => &["withdraw", "withdraw_max", "cancel_stream"],
+            Branch::RecipientPayoutFailed => {
+                &["withdraw", "withdraw_max", "withdraw_many", "cancel_stream"]
+            }
             Branch::SenderRefundFailed => &["cancel_stream"],
             Branch::TreasuryPayoutFailed => &["withdraw_treasury"],
             Branch::PolicyAssetNotAllowed => &["create_stream", "create_streams"],
@@ -446,6 +484,7 @@ impl Branch {
                 "create_streams",
                 "withdraw",
                 "withdraw_max",
+                "withdraw_many",
                 "cancel_stream",
                 "top_up",
                 "propose_ownership_transfer",
@@ -488,6 +527,7 @@ impl Branch {
                 "available",
                 "withdraw",
                 "withdraw_max",
+                "withdraw_many",
                 "cancel_stream",
                 "top_up",
                 "sponsored_withdraw",
@@ -599,6 +639,11 @@ impl Branch {
             Branch::SenderTransferNotConsenter => StreamError::SenderTransferNotConsenter,
             Branch::RefundTargetNotSender => StreamError::RefundTargetNotSender,
             Branch::RefundTargetUnchanged => StreamError::RefundTargetUnchanged,
+            Branch::WithdrawManyEmpty => StreamError::WithdrawBatchEmpty,
+            Branch::WithdrawManyTooLarge => StreamError::WithdrawBatchTooLarge,
+            Branch::WithdrawManyDuplicateIds => StreamError::WithdrawDuplicateStreamIds,
+            Branch::WithdrawManyNotStreamRecipient => StreamError::NotAuthorized,
+            Branch::WithdrawManyTotalOverflow => StreamError::MathOverflow,
         }
     }
 
@@ -773,6 +818,19 @@ impl Branch {
             Branch::RefundTargetUnchanged => {
                 "the address already holds the refund claim, so routing to it changes nothing"
             }
+            Branch::WithdrawManyEmpty => "the batch withdraw was requested with zero stream ids",
+            Branch::WithdrawManyTooLarge => {
+                "the batch withdraw exceeds MAX_WITHDRAW_BATCH stream ids"
+            }
+            Branch::WithdrawManyDuplicateIds => {
+                "the same stream id appears more than once in the batch"
+            }
+            Branch::WithdrawManyNotStreamRecipient => {
+                "a stream in the batch belongs to a different recipient than the caller"
+            }
+            Branch::WithdrawManyTotalOverflow => {
+                "summing the batch's per-stream payouts into the summary total would overflow"
+            }
         }
     }
 
@@ -787,9 +845,13 @@ impl Branch {
             //     a corrupt entry but never below `i128::MIN` (it equals
             //     `-withdrawn`, and `withdrawn <= i128::MAX`).
             //   * `cancel_amounts`: same bound on both subtractions.
+            //   * `withdraw_many`: every entry pays out through `pay_out`, so
+            //     the batch total is the recipient's balance increase and is
+            //     likewise bounded by `i128::MAX`.
             Branch::PayoutOverflow
             | Branch::AvailableBalanceOverflow
-            | Branch::CancelSplitOverflow => Reachability::Defensive,
+            | Branch::CancelSplitOverflow
+            | Branch::WithdrawManyTotalOverflow => Reachability::Defensive,
             _ => Reachability::Reachable,
         }
     }

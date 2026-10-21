@@ -8,6 +8,7 @@ import {
   createStreams,
   withdrawFromStream,
   withdrawMaxFromStream,
+  claimStreamsWithReceipt,
   topUpStream,
   cancelStream,
   readStream,
@@ -16,6 +17,7 @@ import {
   describeError,
   type StreamView,
 } from "@/lib/stellar";
+import { BATCH_CLAIM_ENABLED } from "@/lib/withdrawal";
 import { loadStreamIds, saveStreamId } from "@/lib/storage";
 import { checkWalletNetwork } from "@/lib/network";
 import { useLocale } from "@/lib/i18n/provider";
@@ -283,6 +285,26 @@ export default function Home() {
               toast.error(describeError(e));
             }
           }}
+          onClaimBatch={
+            BATCH_CLAIM_ENABLED
+              ? async (ids) => {
+                  try {
+                    const receipt = await claimStreamsWithReceipt(address, ids);
+                    const settled = receipt.rows.filter((row) => row.settled);
+                    const skipped = receipt.rows.length - settled.length;
+                    toast.success(
+                      `Claimed ${settled.length} stream(s) in one transaction, ` +
+                        `${receipt.total} units total${skipped ? `, ${skipped} skipped` : ""}.`
+                    );
+                    await Promise.all(
+                      receipt.rows.map((row) => refresh(row.streamId))
+                    );
+                  } catch (e) {
+                    toast.error(describeError(e));
+                  }
+                }
+              : undefined
+          }
           onTopUp={async (id, amount) => {
             try {
               await topUpStream(address, id, amount);

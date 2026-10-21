@@ -59,6 +59,18 @@ pub const MIN_BATCH: u32 = 1;
 /// and consumes ~16.2M CPU instructions (~16% of the 100M transaction budget).
 pub const MAX_BATCH: u32 = 25;
 
+/// Maximum number of stream ids a single `withdraw_many` call may carry.
+///
+/// Tighter than [`MAX_BATCH`] (creation) because each claim entry costs more
+/// than a creation entry: it reads a stream record, extends its TTL, resolves
+/// oracle time for streams that use an oracle, rewrites the record, emits both
+/// a per-stream `Withdrawn` event and a `transfer`, and pays out. 20 is sized so
+/// the measured worst case — 20 fully accrued claims plus the summary event —
+/// runs at 6.27M CPU against Soroban's 100M-instruction transaction ceiling,
+/// leaving room for the caller's own footprint and rent; see
+/// `test.rs::withdraw_many_footprint_harness` and `docs/FOOTPRINT.md` §4.1.
+pub const MAX_WITHDRAW_BATCH: u32 = 20;
+
 /// Lifetime of a pending ownership proposal, in seconds (7 days).
 ///
 /// A proposal that is not accepted within this window becomes stale: it can no
@@ -254,6 +266,42 @@ pub struct BatchEntry {
     pub start_time: u64,
     pub end_time: u64,
     pub cancelable: bool,
+}
+
+/// One settled entry of a `withdraw_many` batch claim.
+///
+/// `withdraw_many` answers every requested id (see [`WithdrawEntry`]) and this
+/// type describes money that actually moved, so it is also what the batch's
+/// [`crate::BatchWithdrawSummary`] event lists.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawOutcome {
+    pub stream_id: u64,
+    /// The whole accrued-but-unwithdrawn balance delivered for this stream.
+    /// Always positive: an entry that had nothing to pay is an `Err`, not a
+    /// zero-amount outcome.
+    pub amount: i128,
+}
+
+/// The per-entry answer of [`crate::StreamingPayments::withdraw_many`], one per
+/// requested id and in request order.
+///
+/// This is deliberately a struct carrying an amount *or* a code, rather than a
+/// `Vec<Result<WithdrawOutcome, StreamError>>`. Soroban encodes `Result::Err` as
+/// an `ScError`, and the off-chain ScVal decoder (`scValToNative` in
+/// `@stellar/stellar-sdk`) has no conversion for it, so a batch with even one
+/// skipped entry would arrive as a decode failure instead of a partial result —
+/// defeating the point of per-entry isolation. A map per entry always decodes,
+/// and `code` is the same stable discriminant the contract reports on a revert.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawEntry {
+    pub stream_id: u64,
+    /// Tokens delivered for this stream; `0` when the entry was skipped.
+    pub amount: i128,
+    /// `0` once the entry settled, otherwise the [`crate::StreamError`] that
+    /// skipped it, as its numeric code.
+    pub code: u32,
 }
 
 /// Proposed contract upgrade pending timelock expiration.
