@@ -98,7 +98,8 @@ pub use events::{
     OperatorKeyRotated, OracleConfigUpdated, OracleStaleFallback, OracleTimeReported,
     OwnershipAccepted, OwnershipProposed, PolicyAssetExecuted, PolicyAssetQueued,
     PolicyHandoffAccepted, PolicyHandoffCancelled, PolicyHandoffProposed, PolicyInitialized,
-    ScheduledIntentCancelled, ScheduledIntentExpired, ScheduledStreamExecuted, SponsorActiveSet,
+    ScheduledIntentCancelled, ScheduledIntentExpired, ScheduledStreamExecuted,
+    SenderTransferExpired, SenderTransferProposed, SenderTransferred, SponsorActiveSet,
     SponsorClaim, SponsorRegistered, StorageMigrated, StreamCancelled, StreamCreated,
     StreamPolicySet, StreamRecordMigrated, StreamScheduled, StreamToppedUp, StreamsCreated,
     UpgradeCancelled, UpgradeProposed, Withdrawn,
@@ -110,8 +111,9 @@ pub use sponsor::{PeriodSpend, SponsorConfig};
 // `streamed_at` is re-exported for the fuzz target and downstream rate
 // calculators: it is a pure function requiring no `Env`.
 pub use stream::{
-    streamed_at, BatchEntry, MigrationStatus, OwnershipRole, PendingOwnership, PendingUpgrade,
-    Stream, StreamStatus, StreamVersionReport, VersionedStream, CURRENT_STREAM_RECORD_VERSION,
+    streamed_at, BatchEntry, MigrationStatus, OwnershipRole, PendingOwnership,
+    PendingSenderTransfer, PendingUpgrade, SenderHistory, SenderTransferRecord, Stream,
+    StreamStatus, StreamVersionReport, VersionedStream, CURRENT_STREAM_RECORD_VERSION,
     INITIAL_SCHEMA_VERSION, MAX_BATCH, MAX_DURATION_SECONDS, MAX_MIGRATION_BATCH_SIZE,
     MAX_PAGE_SIZE, MIN_BATCH, MIN_UPGRADE_DELAY_SECONDS, OWNERSHIP_PROPOSAL_TTL_SECONDS,
     STREAM_RECORD_VERSION_V1, STREAM_RECORD_VERSION_V2, TARGET_SCHEMA_VERSION,
@@ -890,6 +892,10 @@ impl StreamingPayments {
 
         let resolved = oracle::resolve_stream_time(&env, stream_id, s.use_oracle);
         let (recipient_amount, sender_amount) = stream::cancel_amounts_at(&s, resolved.timestamp)?;
+        // Resolved before the state write: the refund belongs to the claim that
+        // backed the deposit, which only stays the same as `s.sender` until a
+        // consented transfer or an amendment says otherwise.
+        let refund_to = stream::refund_target(&env, &s);
 
         // Effects first (CEI): finalise state before moving tokens.
         s.status = StreamStatus::Cancelled;
@@ -931,7 +937,7 @@ impl StreamingPayments {
                     &env,
                     &s.token,
                     &current_contract,
-                    &stream::muxed(&s.sender),
+                    &stream::muxed(&refund_to),
                     sender_amount,
                     Branch::SenderRefundFailed,
                 )?;
@@ -1175,6 +1181,196 @@ impl StreamingPayments {
     /// return `None`.
     pub fn pending_ownership_transfer(env: Env, stream_id: u64) -> Option<PendingOwnership> {
         stream::get_pending_ownership(&env, stream_id)
+    }
+
+    /// Proposes handing the **sender** role of a stream to a new address.
+    ///
+    /// Only the current sender may propose, and the proposal does not move the
+    /// role: a sender transfer changes who pays the recipient and who can
+    /// cancel the stream, so it is the *recipient's* decision to take. The
+    /// proposal therefore waits for [`StreamingPayments::accept_sender_transfer`]
+    /// from the recipient, inside `OWNERSHIP_PROPOSAL_TTL_SECONDS`.
+    ///
+    /// `nonce` is the caller's freshness marker. It is stored with the proposal,
+    /// echoed by the proposal's events and must be repeated exactly by the
+    /// consent, so a consent can never land on a proposal that was replaced in
+    /// the meantime.
+    ///
+    /// `transfer_refund_rights` decides, up front, what the recipient is
+    /// consenting to: with `false` (the default meaning auditors expect) the
+    /// deposit's refund claim stays with the original sender, and only the role
+    /// moves; with `true` the claim moves to `new_sender` as well. Refund rights
+    /// are never implied by a role change — the flag is the whole mechanism.
+    pub fn propose_sender_transfer(
+        env: Env,
+        caller: Address,
+        stream_id: u64,
+        new_sender: Address,
+        nonce: u64,
+        transfer_refund_rights: bool,
+    ) -> Result<(), StreamError> {
+        Self::require_not_frozen(&env)?;
+        caller.require_auth();
+
+        let s = stream::get_stream(&env, stream_id)?;
+        if s.status != StreamStatus::Active {
+            return Err(surface::reject(Branch::StreamNotActive));
+        }
+        if caller != s.sender {
+            return Err(surface::reject(Branch::ProposeNotAuthorized));
+        }
+        // The recipient stays who they are; handing the payer role to the
+        // recipient would collapse both roles onto one address.
+        if new_sender == s.sender || new_sender == s.recipient {
+            return Err(surface::reject(Branch::ProposeInvalidTarget));
+        }
+
+        let now = env.ledger().timestamp();
+        if let Some(existing) = stream::get_pending_sender_transfer(&env, stream_id) {
+            if now < existing.expires_at {
+                return Err(surface::reject(Branch::SenderTransferPending));
+            }
+            // A proposal that aged out is replaced here rather than requiring a
+            // separate cleanup call; `expire_sender_transfer` exists for anyone
+            // who wants the reclaim (and its event) on its own.
+            stream::remove_pending_sender_transfer(&env, stream_id);
+        }
+
+        let pending = PendingSenderTransfer {
+            stream_id,
+            sender_from: caller.clone(),
+            new_sender: new_sender.clone(),
+            nonce,
+            expires_at: now.saturating_add(OWNERSHIP_PROPOSAL_TTL_SECONDS),
+            transfer_refund_rights,
+        };
+        stream::put_pending_sender_transfer(&env, &pending);
+
+        #[cfg(test)]
+        cei_trace::record("event SenderTransferProposed");
+        SenderTransferProposed {
+            stream_id,
+            sender_from: caller,
+            new_sender,
+            nonce,
+            expires_at: pending.expires_at,
+            transfer_refund_rights,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Executes a proposed sender transfer on the recipient's consent.
+    ///
+    /// The caller must be the stream's **recipient** — the party whose
+    /// counterparty changes — and must present the proposal's nonce. On success
+    /// the role moves, the sender discovery indexes are re-pointed for both
+    /// sides, and the hop is appended to the stream's immutable sender log.
+    /// `deposit`, `withdrawn`, the time window and the token are untouched, so
+    /// accrual and the `0 <= withdrawn <= streamed <= deposit` invariant are
+    /// unchanged.
+    ///
+    /// An elapsed window is [`StreamError::SenderTransferExpired`], never a
+    /// silent no-op; the stale entry is then reclaimed with
+    /// [`StreamingPayments::expire_sender_transfer`].
+    pub fn accept_sender_transfer(
+        env: Env,
+        caller: Address,
+        stream_id: u64,
+        nonce: u64,
+    ) -> Result<(), StreamError> {
+        Self::require_not_frozen(&env)?;
+        caller.require_auth();
+
+        let pending = stream::get_pending_sender_transfer(&env, stream_id)
+            .ok_or_else(|| surface::reject(Branch::SenderTransferNotFound))?;
+        let s = stream::get_stream(&env, stream_id)?;
+        if s.status != StreamStatus::Active {
+            return Err(surface::reject(Branch::StreamNotActive));
+        }
+        if caller != s.recipient {
+            return Err(surface::reject(Branch::SenderTransferNotConsenter));
+        }
+        if nonce != pending.nonce {
+            return Err(surface::reject(Branch::SenderTransferNonceMismatch));
+        }
+        if env.ledger().timestamp() >= pending.expires_at {
+            return Err(surface::reject(Branch::SenderTransferExpired));
+        }
+
+        // Effects (CEI): state first, then the event. No tokens move — this
+        // entrypoint changes roles only.
+        stream::apply_sender_transfer(&env, &s, &pending)?;
+        stream::remove_pending_sender_transfer(&env, stream_id);
+
+        #[cfg(test)]
+        cei_trace::record("event SenderTransferred");
+        SenderTransferred {
+            stream_id,
+            sender_from: pending.sender_from,
+            sender_to: pending.new_sender.clone(),
+            nonce,
+            refund_rights_transferred: pending.transfer_refund_rights,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Reclaims a sender-transfer proposal whose acceptance window has elapsed.
+    ///
+    /// Permissionless like the version-migration path: nothing about removing a
+    /// dead proposal can move funds or change an accounting field, so any keeper
+    /// may pay the gas to free the storage. Returns the reclaimed nonce so the
+    /// caller can confirm which proposal they removed.
+    ///
+    /// Refuses while the proposal is still live ([`StreamError::
+    /// SenderTransferNotExpired`]) — the window, not a third party, is what ends
+    /// a recipient's option to consent — and with [`StreamError::
+    /// SenderTransferNotFound`] when there is nothing to reclaim.
+    pub fn expire_sender_transfer(env: Env, stream_id: u64) -> Result<u64, StreamError> {
+        Self::require_not_frozen(&env)?;
+
+        let pending = stream::get_pending_sender_transfer(&env, stream_id)
+            .ok_or_else(|| surface::reject(Branch::SenderTransferNotFound))?;
+        if env.ledger().timestamp() < pending.expires_at {
+            return Err(surface::reject(Branch::SenderTransferNotExpired));
+        }
+        stream::remove_pending_sender_transfer(&env, stream_id);
+
+        #[cfg(test)]
+        cei_trace::record("event SenderTransferExpired");
+        SenderTransferExpired {
+            stream_id,
+            sender_from: pending.sender_from.clone(),
+            new_sender: pending.new_sender.clone(),
+            nonce: pending.nonce,
+        }
+        .publish(&env);
+
+        Ok(pending.nonce)
+    }
+
+    /// Read-only view of a stream's pending sender transfer, if any.
+    pub fn pending_sender_transfer(env: Env, stream_id: u64) -> Option<PendingSenderTransfer> {
+        stream::get_pending_sender_transfer(&env, stream_id)
+    }
+
+    /// The append-only sender-role log of a stream: who held the payer role at
+    /// creation and every consented hop since. Never rewritten, so the answer to
+    /// "who funded this deposit?" survives any number of transfers.
+    pub fn sender_history(env: Env, stream_id: u64) -> Result<SenderHistory, StreamError> {
+        let s = stream::get_stream(&env, stream_id)?;
+        Ok(stream::sender_history(&env, &s))
+    }
+
+    /// The address that receives the refund of the unstreamed remainder when the
+    /// stream is cancelled. Equal to the current sender unless a sender transfer
+    /// left the claim behind (or an amendment moved it on purpose).
+    pub fn refund_target(env: Env, stream_id: u64) -> Result<Address, StreamError> {
+        let s = stream::get_stream(&env, stream_id)?;
+        Ok(stream::refund_target(&env, &s))
     }
 
     /// Resolves which role `caller` currently holds on `s`.

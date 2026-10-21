@@ -429,3 +429,49 @@ pub struct OwnershipAccepted {
     pub new_owner: Address,
     pub role: OwnershipRole,
 }
+
+/// Emitted when the sender proposes handing the payer role to a new address.
+/// Unlike [`OwnershipProposed`], this handoff is not completed by the target's
+/// acceptance: the *recipient* consents, because changing who pays them (and
+/// who can cancel on them) is their risk to take.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SenderTransferProposed {
+    #[topic]
+    pub stream_id: u64,
+    pub sender_from: Address,
+    pub new_sender: Address,
+    /// The proposal's freshness marker, which the consenting call must repeat.
+    pub nonce: u64,
+    pub expires_at: u64,
+    /// Whether consenting also moves the refund claim for the existing deposit.
+    pub transfer_refund_rights: bool,
+}
+
+/// Emitted when the recipient's consent executes a proposed sender transfer.
+/// `sender_from` / `sender_to` name both sides of the hop; the accounting
+/// fields of the stream are untouched.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SenderTransferred {
+    #[topic]
+    pub stream_id: u64,
+    pub sender_from: Address,
+    pub sender_to: Address,
+    pub nonce: u64,
+    /// False when the deposit's refund claim stayed with the original sender —
+    /// the default, and the reason this is a field rather than an inference.
+    pub refund_rights_transferred: bool,
+}
+
+/// Emitted when a proposal that aged out of its acceptance window is reclaimed,
+/// freeing its storage. The role never moved.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SenderTransferExpired {
+    #[topic]
+    pub stream_id: u64,
+    pub sender_from: Address,
+    pub new_sender: Address,
+    pub nonce: u64,
+}

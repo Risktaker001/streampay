@@ -191,6 +191,26 @@ pub enum StreamError {
     /// current versioned layout nor the legacy untagged one. Reads fail closed
     /// rather than guessing — see `stream::get_stream_record`.
     SchemaVersionUnsupported = 64,
+    /// No sender-transfer proposal is stored for the stream, or the one that
+    /// was there has already been executed, cancelled or replaced.
+    SenderTransferNotFound = 65,
+    /// The sender-transfer proposal's acceptance window has elapsed; the role
+    /// did not move. Reclaim the stale entry with `expire_sender_transfer`.
+    SenderTransferExpired = 66,
+    /// `expire_sender_transfer` refused to reclaim a proposal that is still
+    /// inside its acceptance window — only the recipient's consent or the
+    /// window ending may end a proposal.
+    SenderTransferNotExpired = 67,
+    /// The nonce presented with the consent does not match the nonce stored
+    /// with the proposal, so the consent is aimed at a different (or already
+    /// replaced) proposal.
+    SenderTransferNonceMismatch = 68,
+    /// An unexpired sender-transfer proposal already exists for this stream;
+    /// let it expire, execute or reclaim it before proposing another.
+    SenderTransferPending = 69,
+    /// The caller is not the stream's recipient, so their consent cannot
+    /// execute a sender-role transfer.
+    SenderTransferNotConsenter = 70,
 }
 
 impl StreamError {
@@ -262,6 +282,12 @@ impl StreamError {
         StreamError::InvalidTransferTarget,
         StreamError::OwnershipProposalPending,
         StreamError::SchemaVersionUnsupported,
+        StreamError::SenderTransferNotFound,
+        StreamError::SenderTransferExpired,
+        StreamError::SenderTransferNotExpired,
+        StreamError::SenderTransferNonceMismatch,
+        StreamError::SenderTransferPending,
+        StreamError::SenderTransferNotConsenter,
     ];
 
     /// The stable numeric value carried across the contract boundary

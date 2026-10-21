@@ -123,6 +123,51 @@ The harness measures:
 
 ---
 
+### Candidate 5: Versioned Stream Records and the Refund-Target Read (Implemented)
+
+Two later changes each bought a property at the cost of metered work on the hot
+paths, so both are recorded here rather than being discovered by a surprised
+contributor:
+
+- **`VersionedStream` envelope (#202).** `DataKey::Stream(id)` now stores
+  `{ version, stream }` instead of a bare `Stream`. Every read pays one extra
+  map decode and every write one extra map encode, and the record grows by the
+  version symbol. This is what makes a future layout change decodable at all —
+  the fail-closed probe in `get_stream_record` needs a tag to probe against.
+- **`DataKey::RefundTarget(id)` read (#201).** `cancel_stream` resolves the
+  address that owns the unaccrued remainder before it writes state, because a
+  consented sender-role transfer must be able to leave that claim behind with
+  the address that funded the deposit. The read happens on every cancel, and a
+  *missing* key is metered like a present one, so a stream that never had a
+  transfer pays the difference too.
+- **Rejected alternative:** a `refund_to` field on `Stream`. `#[contracttype]`
+  structs encode positionally (§13.2 of `docs/ARCHITECTURE.md`), so adding a
+  field would make every already-stored record undecodable — the one change
+  the storage-versioning work exists to make unnecessary. A separate key costs
+  CPU; a field would cost the ledger's history.
+- **Storage growth is append-only and bounded per stream:** at most three extra
+  keys exist for a stream that has been through the sender-transfer surface
+  (`PendingSenderTransfer`, `RefundTarget`, `SenderHistory`), and each is under
+  the same 200,000/500,000-ledger TTL regime as the stream entry itself, so an
+  abandoned stream still archives.
+
+Re-measured with `cargo test -p streampay-contract --lib hot_path_footprint
+--nocapture` (which prints `FOOTPRINT: path=… cpu=… mem=…` for each step):
+
+| Operation | CPU Instructions | Memory (Bytes) | vs. §3.1 baseline |
+|---|---:|---:|---:|
+| `create_stream` | 546,291 | 214,304 | +4,693 (+0.87%) |
+| `withdraw` | 354,596 | 143,334 | +7,514 (+2.17%) |
+| `withdraw_max` | 347,710 | 138,764 | +9,047 (+2.67%) |
+| `cancel_stream` | 552,355 | 181,145 | +28,792 (+5.50%) |
+
+`cancel_stream` is the only path that pays both effects; the rest of the delta
+is the record envelope. Its harness budget was raised from 540,000 to
+580,000 CPU instructions accordingly, and the harness now prints the numbers
+above so the next change to a hot path is measured, not estimated.
+
+---
+
 ## 5. Before vs. After Footprint Comparison
 
 | Operation | Metric | Before | After | Change |

@@ -41,9 +41,9 @@ reentrancy, TTL strategy, and the design decisions behind the v1 API. Read the
 | Key | Value | Purpose |
 |---|---|---|
 | `DataKey::NextStreamId` | `u64` | monotonic id counter (ids start at 1) |
-| `DataKey::Stream(id)` | `Stream` | full per-stream state |
+| `DataKey::Stream(id)` | `VersionedStream` | tagged envelope (`{ version, stream }`) holding the full per-stream state; a legacy untagged `Stream` map still decodes as v1 (see [`UPGRADES.md`](./UPGRADES.md)) |
 | `DataKey::RecipientStreams(addr)` | `Vec<u64>` | append-only ids where `addr` receives |
-| `DataKey::SenderStreams(addr)` | `Vec<u64>` | append-only ids created by `addr` |
+| `DataKey::SenderStreams(addr)` | `Vec<u64>` | ids `addr` currently pays: append-only, except that a consented sender-role transfer prunes the outgoing holder's entry (§18) |
 | `DataKey::NextIntentId` | `u64` | monotonic scheduled-intent id counter |
 | `DataKey::Intent(id)` | `ScheduledIntent` | full per-intent state (escrow, timing, `params_hash`) |
 | `DataKey::SenderIntents(addr)` | `Vec<u64>` | append-only intent ids scheduled by `addr` |
@@ -53,6 +53,9 @@ reentrancy, TTL strategy, and the design decisions behind the v1 API. Read the
 | `DataKey::Treasury(token)` | `Treasury` | per-token fee accounting (`charged_total`, `withdrawn_total`) |
 | `DataKey::StreamFee(id)` | `StreamFeeRecord` | fee charged at creation: amount + token; absent = 0 |
 | `DataKey::PendingOwnership(id)` | `PendingOwnership` | at most one unexpired role-proposal per stream |
+| `DataKey::PendingSenderTransfer(id)` | `PendingSenderTransfer` | at most one unexpired sender-role proposal per stream |
+| `DataKey::SenderHistory(id)` | `SenderHistory` | append-only log: sender at creation + every consented hop |
+| `DataKey::RefundTarget(id)` | `Address` | who owns the cancellation remainder; absent = the current `sender` |
 
 Streams live in **persistent** storage. Every mutating entrypoint that touches
 a stream extends its TTL (`TTL_THRESHOLD_LEDGERS = 200_000`, extend to
@@ -167,6 +170,9 @@ nothing has accrued, at `now ≥ end_time` the full duration has elapsed.
 | `propose_ownership_transfer` | current sender or recipient | caller |
 | `accept_ownership_transfer` | named pending `new_owner` only | new owner |
 | `cancel_ownership_transfer` | pending proposer only | proposer |
+| `propose_sender_transfer` | the stream's current sender only | caller (the outgoing sender) |
+| `accept_sender_transfer` | the stream's recipient only, with the stored nonce | recipient |
+| `expire_sender_transfer` | anyone, after the proposal window | none |
 | `schedule_stream` | anyone; `sender` must authorize | sender |
 | `execute_scheduled` | anyone (keeper) | keeper (the caller) |
 | `cancel_scheduled` | intent sender, before the window opens | sender |
@@ -334,9 +340,17 @@ the public interface:
 | 61 | `OwnershipProposalExpired` | accept after the proposal's seven-day window |
 | 62 | `InvalidTransferTarget` | proposing to the role's current holder |
 | 63 | `OwnershipProposalPending` | proposing while an unexpired proposal exists |
+| 64 | `SchemaVersionUnsupported` | a stored stream record decodes as neither known layout, or names a version this build cannot read |
+| 65 | `SenderTransferNotFound` | `accept_sender_transfer` / `expire_sender_transfer` with no proposal stored |
+| 66 | `SenderTransferExpired` | consent after the proposal's seven-day window |
+| 67 | `SenderTransferNotExpired` | `expire_sender_transfer` while the window is still open |
+| 68 | `SenderTransferNonceMismatch` | consent presenting a nonce that is not the stored proposal's |
+| 69 | `SenderTransferPending` | proposing while an unexpired sender-transfer proposal exists |
+| 70 | `SenderTransferNotConsenter` | anyone but the stream's recipient executing a sender transfer |
 
 Codes 31–59 (policy, upgrades, batch limits, sponsorship, and oracle) are
-catalogued in [`docs/errors.md`](./errors.md).
+catalogued in [`docs/errors.md`](./errors.md). 64 is the storage-versioning tail
+([`UPGRADES.md`](./UPGRADES.md)); 65–70 are the sender-transfer surface (§18).
 
 Codes 26–30 are *transfer-failure* codes: a token's own error number is
 deliberately never propagated (see §5), so clients can always branch on these
@@ -839,6 +853,9 @@ Events are the off-chain ledger indexers consume; fields decode by position
 | `StreamToppedUp` | `stream_id: u64` | `sender: Address`; `amount: i128`; `new_deposit: i128` |
 | `FeeCharged` | `stream_id: u64` | `token: Address`; `payer: Address`; `amount: i128`; `fee_bps: u32` |
 | `FeeWithdrawn` | `token: Address` | `governor: Address`; `recipient: Address`; `amount: i128`; `withdrawn_total: i128` |
+| `SenderTransferProposed` | `stream_id: u64` | `sender_from: Address`; `new_sender: Address`; `nonce: u64`; `expires_at: u64`; `transfer_refund_rights: bool` |
+| `SenderTransferred` | `stream_id: u64` | `sender_from: Address`; `sender_to: Address`; `nonce: u64`; `refund_rights_transferred: bool` |
+| `SenderTransferExpired` | `stream_id: u64` | `sender_from: Address`; `new_sender: Address`; `nonce: u64` |
 
 Never add, remove, reorder, or retype fields of an existing event; emit a
 new event type instead. Tests must filter by contract and compare typed XDR
@@ -1051,7 +1068,8 @@ every accounting field is definitionally unchanged, so for all `t`:
    possible because both recipients read and write the same `withdrawn`
    counter. Sender transfer redirects future top-up pulls and cancellation
    refunds; cancellation still splits `streamed − withdrawn` to the recipient
-   and `deposit − streamed` to the current sender.
+   and `deposit − streamed` to the refund target, which is the current sender
+   unless §18 pinned it elsewhere.
 4. **Terminal safety.** Transfer is limited to `Active` streams, so a
    cancelled/depleted stream can never acquire a new claimant or payer.
 
@@ -1059,3 +1077,61 @@ The test suite exercises each step: recipient transfer mid-accrual followed by
 a withdrawal, sender transfer followed by top-up + cancel with exact balance
 assertions, expiry at the exact TTL boundary, proposal cancellation, and index
 contents for both old and new holders.
+
+## 18. Consented sender-role transfer
+
+§17 moves a role to the address that will hold it, so that address consents. A
+**sender-role transfer** is the other case: the payer changes, and the party
+losing a counterparty is the recipient — so the *recipient* consents, and the
+proposal is nonce-bound so a consent can only name one proposal.
+
+```text
+propose_sender_transfer(caller, id, new_sender, nonce, transfer_refund_rights)
+    caller must be the current sender; stream must be Active
+    new_sender must be neither the sender nor the recipient
+    stores PendingSenderTransfer { stream_id, sender_from, new_sender, nonce,
+                                   expires_at, transfer_refund_rights }
+    emits SenderTransferProposed
+        │
+        ├─ accept_sender_transfer(recipient, id, nonce)
+        │     caller must equal stream.recipient   → SenderTransferNotConsenter (70)
+        │     nonce must equal the stored one       → SenderTransferNonceMismatch (68)
+        │     window must still be open             → SenderTransferExpired (66)
+        │     role moves: sender := new_sender
+        │     both SenderStreams pages rewritten and TTL-extended
+        │     RefundTarget := new_sender if transfer_refund_rights,
+        │                      else the claim as it stood before the hop
+        │     SenderHistory gains one immutable record
+        │     pending key removed, emits SenderTransferred
+        │
+        └─ expire_sender_transfer(id)  — after the window, permissionless
+              returns the reclaimed nonce, emits SenderTransferExpired
+              refuses while the proposal is live → SenderTransferNotExpired (67)
+```
+
+**Why the claim is explicit.** `deposit` funds a stream, and the unaccrued
+remainder is whoever paid's money. A role hop changes who may top up and who
+may cancel; it does not change who funded it. So `transfer_refund_rights` is a
+separate field on the proposal rather than a consequence of the hop, and
+`DataKey::RefundTarget(id)` records the answer permanently: `refund_target()`
+falls back to `stream.sender` when the key is absent, and `apply_sender_transfer`
+pins the key on every hop — to the incoming sender only when the proposal asked
+for it. A chain `A → B → C` with no flag set therefore still pays A, which is
+the property the append-only log exists to make auditable.
+
+**Index migration.** Both sides of the hop are rewritten with the same helpers
+the creation path uses (`index_sender` appends through `push_to_index`,
+`unindex_sender` prunes through `remove_from_index`), so a page cannot be
+extended on one side and left to go cold on the other. The prune preserves the
+order of the remaining ids. `RecipientStreams` is untouched: the recipient did
+not change. Unlike §17's append-only index rule, the outgoing sender's page
+stops listing the stream — the point of the feature is that nobody discovers a
+stream under an address that no longer controls it.
+
+**Storage and accounting.** Nothing about a hop moves a token: the effects are
+`Stream`, `SenderStreams` (both pages), `RefundTarget` and `SenderHistory`
+writes plus the removal of the proposal key, which is exactly the trace pinned
+by `test_orderings/sender_transfer.txt`. `deposit`, `withdrawn`, `token`,
+`start_time`, `end_time` and `status` are untouched, so §17's invariance proof
+applies unchanged. Cost and growth are documented in
+[`FOOTPRINT.md`](./FOOTPRINT.md) (Candidate 5).

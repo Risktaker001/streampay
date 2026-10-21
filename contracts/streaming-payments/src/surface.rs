@@ -203,13 +203,27 @@ pub enum Branch {
     /// version this build does not understand (or has a shape that matches
     /// neither the current versioned layout nor the legacy one).
     SchemaVersionUnsupported,
+    // ------------------------------------------ sender-role transfer
+    /// `accept_sender_transfer` / `expire_sender_transfer`: no proposal is
+    /// stored for the stream.
+    SenderTransferNotFound,
+    /// `accept_sender_transfer`: the acceptance window elapsed.
+    SenderTransferExpired,
+    /// `expire_sender_transfer`: the proposal is still inside its window.
+    SenderTransferNotExpired,
+    /// `accept_sender_transfer`: the presented nonce is not the stored one.
+    SenderTransferNonceMismatch,
+    /// `propose_sender_transfer`: an unexpired proposal already exists.
+    SenderTransferPending,
+    /// `accept_sender_transfer`: the caller is not the stream's recipient.
+    SenderTransferNotConsenter,
 }
 
 impl Branch {
     /// Every branch, in declaration order. The matrix test walks this list and
     /// the coverage test requires each [`StreamError`] variant to be produced by
     /// one of these (or retired).
-    pub const ALL: [Branch; 78] = [
+    pub const ALL: [Branch; 84] = [
         Branch::CreateDepositNonPositive,
         Branch::CreateStartTimeInPast,
         Branch::CreateInvalidTimeRange,
@@ -288,6 +302,12 @@ impl Branch {
         Branch::NoPendingOwnership,
         Branch::CancelProposalNotProposer,
         Branch::SchemaVersionUnsupported,
+        Branch::SenderTransferNotFound,
+        Branch::SenderTransferExpired,
+        Branch::SenderTransferNotExpired,
+        Branch::SenderTransferNonceMismatch,
+        Branch::SenderTransferPending,
+        Branch::SenderTransferNotConsenter,
     ];
 
     /// The entrypoint(s) through which this branch can fire. Shared helpers
@@ -318,6 +338,8 @@ impl Branch {
                 "sponsored_withdraw",
                 "propose_ownership_transfer",
                 "accept_ownership_transfer",
+                "propose_sender_transfer",
+                "accept_sender_transfer",
                 "stream_record_version",
                 "migrate_stream_version",
             ],
@@ -329,6 +351,8 @@ impl Branch {
                 "sponsored_withdraw",
                 "propose_ownership_transfer",
                 "accept_ownership_transfer",
+                "propose_sender_transfer",
+                "accept_sender_transfer",
             ],
             Branch::CapacityOverflow => &["create_stream", "top_up"],
             Branch::RateProductOverflow => &[
@@ -414,6 +438,9 @@ impl Branch {
                 "propose_ownership_transfer",
                 "accept_ownership_transfer",
                 "cancel_ownership_transfer",
+                "propose_sender_transfer",
+                "accept_sender_transfer",
+                "expire_sender_transfer",
                 "migrate_stream_version",
             ],
             Branch::MigrationNotFrozen | Branch::AlreadyMigrated => &["migrate_storage"],
@@ -430,9 +457,10 @@ impl Branch {
             Branch::OraclePublishersNotConfigured
             | Branch::OracleReportTooOld
             | Branch::NotOraclePublisher => &["submit_oracle_time"],
-            Branch::ProposeNotAuthorized
-            | Branch::ProposeInvalidTarget
-            | Branch::ProposeAlreadyPending => &["propose_ownership_transfer"],
+            Branch::ProposeNotAuthorized | Branch::ProposeInvalidTarget => {
+                &["propose_ownership_transfer", "propose_sender_transfer"]
+            }
+            Branch::ProposeAlreadyPending => &["propose_ownership_transfer"],
             Branch::AcceptNotTarget | Branch::OwnershipProposalExpired => {
                 &["accept_ownership_transfer"]
             }
@@ -451,6 +479,13 @@ impl Branch {
                 "stream_record_version",
                 "migrate_stream_version",
             ],
+            Branch::SenderTransferNotFound => &["accept_sender_transfer", "expire_sender_transfer"],
+            Branch::SenderTransferExpired | Branch::SenderTransferNonceMismatch => {
+                &["accept_sender_transfer"]
+            }
+            Branch::SenderTransferNotExpired => &["expire_sender_transfer"],
+            Branch::SenderTransferPending => &["propose_sender_transfer"],
+            Branch::SenderTransferNotConsenter => &["accept_sender_transfer"],
         }
     }
 
@@ -539,6 +574,12 @@ impl Branch {
             Branch::OwnershipProposalExpired => StreamError::OwnershipProposalExpired,
             Branch::NoPendingOwnership => StreamError::NoPendingOwnership,
             Branch::SchemaVersionUnsupported => StreamError::SchemaVersionUnsupported,
+            Branch::SenderTransferNotFound => StreamError::SenderTransferNotFound,
+            Branch::SenderTransferExpired => StreamError::SenderTransferExpired,
+            Branch::SenderTransferNotExpired => StreamError::SenderTransferNotExpired,
+            Branch::SenderTransferNonceMismatch => StreamError::SenderTransferNonceMismatch,
+            Branch::SenderTransferPending => StreamError::SenderTransferPending,
+            Branch::SenderTransferNotConsenter => StreamError::SenderTransferNotConsenter,
         }
     }
 
@@ -688,6 +729,24 @@ impl Branch {
             }
             Branch::SchemaVersionUnsupported => {
                 "the stored record carries a layout version this build does not understand"
+            }
+            Branch::SenderTransferNotFound => {
+                "no sender-transfer proposal is stored for the stream"
+            }
+            Branch::SenderTransferExpired => {
+                "the sender transfer's acceptance window has elapsed"
+            }
+            Branch::SenderTransferNotExpired => {
+                "the sender transfer is still inside its acceptance window"
+            }
+            Branch::SenderTransferNonceMismatch => {
+                "the presented nonce does not match the stored proposal's nonce"
+            }
+            Branch::SenderTransferPending => {
+                "an unexpired sender-transfer proposal already exists for the stream"
+            }
+            Branch::SenderTransferNotConsenter => {
+                "the caller is not the stream's recipient"
             }
         }
     }

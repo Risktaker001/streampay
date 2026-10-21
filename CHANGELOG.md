@@ -45,6 +45,37 @@ interface: they are only ever appended to, never renumbered or reused.
   is shared with the frontend; the golden report is
   [`docs/MIGRATION_AUDIT.md`](docs/MIGRATION_AUDIT.md), regenerated and diffed
   in CI. Documented in `docs/UPGRADES.md`.
+- **Consented sender-role transfer**: `propose_sender_transfer(stream_id,
+  new_sender, nonce, transfer_refund_rights)` (current sender only) records a
+  proposal with the same seven-day window, and `accept_sender_transfer(stream_id,
+  nonce)` executes it only on the *recipient's* consent — the party that loses
+  its counterparty when the payer changes. Anyone may reclaim an aged-out
+  proposal with `expire_sender_transfer(stream_id)`, which returns the nonce it
+  removed; a live proposal refuses (`SenderTransferNotExpired`). Only `sender`
+  moves: deposit, withdrawn, token and window are untouched, so accrual and the
+  `0 ≤ withdrawn ≤ streamed ≤ deposit` invariant are identical across a hop.
+  Each executed hop is appended to the stream's immutable `SenderHistory` log
+  (`sender_at_creation` never changes) and re-points *both* sides of the sender
+  discovery index through the shared index writers, TTL-extending each page.
+  The refund claim of the existing deposit is **not** implied by the role
+  change: it stays with whoever held it unless the proposal sets
+  `transfer_refund_rights`, and `refund_target(stream_id)` always reports where
+  the cancellation remainder would go. `cancel_stream` pays that target with the
+  same CEI ordering and conservation properties as before, at the cost of one
+  extra persistent read (`docs/FOOTPRINT.md`, Candidate 5).
+- New storage keys (append-only): `PendingSenderTransfer(id)`,
+  `SenderHistory(id)`, `RefundTarget(id)`.
+- Append-only events: `SenderTransferProposed`, `SenderTransferred`,
+  `SenderTransferExpired` (all with the `stream_id` topic; the executed event
+  carries `sender_from` / `sender_to`).
+- New `StreamError` variants (appended): `SenderTransferNotFound` (65),
+  `SenderTransferExpired` (66), `SenderTransferNotExpired` (67),
+  `SenderTransferNonceMismatch` (68), `SenderTransferPending` (69),
+  `SenderTransferNotConsenter` (70).
+- Randomised hop sequences (fixed seeds in `contracts/streaming-payments`)
+  assert after every step that the proposal slot, the role, the append-only log,
+  the refund claim, the escrow balance and every address index agree with an
+  independent model. Documented in `docs/ARCHITECTURE.md` §18.
 - Frontend (opt-in) **fee-aware claim scheduling**: a recipient can queue a
   signed `withdraw_max` intent and have the client submit it when the Soroban
   inclusion-fee percentile drops under a budget, with a deadline fallback so a

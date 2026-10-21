@@ -995,6 +995,95 @@ fn probe(branch: Branch) -> Option<StreamError> {
             });
             Some(rejected!(f.client.mock_all_auths().try_get_stream(&id)))
         }
+        Branch::SenderTransferNotFound => {
+            let f = Fixture::setup_quiet();
+            let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+            Some(rejected!(f
+                .client
+                .mock_all_auths()
+                .try_accept_sender_transfer(&f.recipient, &id, &1)))
+        }
+        Branch::SenderTransferExpired => {
+            let f = Fixture::setup_quiet();
+            let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+            let new_sender = soroban_sdk::Address::generate(&f.env);
+            f.client.mock_all_auths().propose_sender_transfer(
+                &f.sender,
+                &id,
+                &new_sender,
+                &1,
+                &false,
+            );
+            f.advance_time(OWNERSHIP_PROPOSAL_TTL_SECONDS);
+            Some(rejected!(f
+                .client
+                .mock_all_auths()
+                .try_accept_sender_transfer(&f.recipient, &id, &1)))
+        }
+        Branch::SenderTransferNotExpired => {
+            let f = Fixture::setup_quiet();
+            let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+            let new_sender = soroban_sdk::Address::generate(&f.env);
+            f.client.mock_all_auths().propose_sender_transfer(
+                &f.sender,
+                &id,
+                &new_sender,
+                &1,
+                &false,
+            );
+            Some(rejected!(f
+                .client
+                .mock_all_auths()
+                .try_expire_sender_transfer(&id)))
+        }
+        Branch::SenderTransferNonceMismatch => {
+            let f = Fixture::setup_quiet();
+            let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+            let new_sender = soroban_sdk::Address::generate(&f.env);
+            f.client.mock_all_auths().propose_sender_transfer(
+                &f.sender,
+                &id,
+                &new_sender,
+                &1,
+                &false,
+            );
+            Some(rejected!(f
+                .client
+                .mock_all_auths()
+                .try_accept_sender_transfer(&f.recipient, &id, &2)))
+        }
+        Branch::SenderTransferPending => {
+            let f = Fixture::setup_quiet();
+            let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+            let first = soroban_sdk::Address::generate(&f.env);
+            let second = soroban_sdk::Address::generate(&f.env);
+            f.client
+                .mock_all_auths()
+                .propose_sender_transfer(&f.sender, &id, &first, &1, &false);
+            Some(rejected!(f
+                .client
+                .mock_all_auths()
+                .try_propose_sender_transfer(
+                    &f.sender, &id, &second, &2, &false
+                )))
+        }
+        Branch::SenderTransferNotConsenter => {
+            let f = Fixture::setup_quiet();
+            let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+            let new_sender = soroban_sdk::Address::generate(&f.env);
+            f.client.mock_all_auths().propose_sender_transfer(
+                &f.sender,
+                &id,
+                &new_sender,
+                &1,
+                &false,
+            );
+            // The incoming sender is not the party whose consent executes it.
+            Some(rejected!(f
+                .client
+                .mock_all_auths()
+                .try_accept_sender_transfer(&new_sender, &id, &1)))
+        }
     }
 }
 
@@ -1165,7 +1254,13 @@ fn stream_error_variant_list_is_exhaustive() {
             | StreamError::OwnershipProposalExpired
             | StreamError::InvalidTransferTarget
             | StreamError::OwnershipProposalPending
-            | StreamError::SchemaVersionUnsupported => StreamError::ALL.contains(&e),
+            | StreamError::SchemaVersionUnsupported
+            | StreamError::SenderTransferNotFound
+            | StreamError::SenderTransferExpired
+            | StreamError::SenderTransferNotExpired
+            | StreamError::SenderTransferNonceMismatch
+            | StreamError::SenderTransferPending
+            | StreamError::SenderTransferNotConsenter => StreamError::ALL.contains(&e),
         }
     }
 

@@ -107,6 +107,68 @@ pub struct PendingOwnership {
     pub expires_at: u64,
 }
 
+/// A pending sender-role transfer that the *recipient* must consent to.
+///
+/// [`PendingOwnership`] moves a role with only the incoming holder's
+/// acceptance; a sender change is different in kind, because the recipient's
+/// counterparty — who they get paid by, and who can cancel the stream — is
+/// being swapped under them. So the transfer is proposed by the current
+/// sender and only executes on the recipient's consent
+/// (`accept_sender_transfer`), inside the proposal's window.
+///
+/// `nonce` is the caller's freshness marker: it is stored with the proposal,
+/// echoed by every event in its lifecycle, and must be repeated exactly by the
+/// consenting call. A proposal that was replaced (and so carries a different
+/// nonce) cannot be executed by accident.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingSenderTransfer {
+    pub stream_id: u64,
+    /// The sender at the time the proposal was made, and the address whose
+    /// authorization is required to propose it.
+    pub sender_from: Address,
+    /// The address that will hold the sender role once the recipient consents.
+    pub new_sender: Address,
+    pub nonce: u64,
+    /// Ledger timestamp at or after which the proposal is stale.
+    pub expires_at: u64,
+    /// Whether consenting also moves the refund claim for the existing deposit
+    /// (see [`SenderTransferRecord::refund_rights_transferred`]). Fixed at
+    /// proposal time so the recipient consents to exactly one meaning.
+    pub transfer_refund_rights: bool,
+}
+
+/// One executed sender transfer, appended to [`SenderHistory::transfers`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SenderTransferRecord {
+    pub sender_from: Address,
+    pub sender_to: Address,
+    pub nonce: u64,
+    /// Ledger timestamp at which the recipient's consent executed the transfer.
+    pub at: u64,
+    /// True when the amendment explicitly moved the refund claim for the
+    /// existing deposit to `sender_to`. False means the deposit keeps accruing
+    /// to the original sender's claim even though the role moved — refund
+    /// rights are only ever moved on purpose, never implied by a role change.
+    pub refund_rights_transferred: bool,
+}
+
+/// Append-only ledger of who held the sender role for one stream.
+///
+/// `sender_at_creation` is the first entry of the record kept for a stream, and
+/// the log is never rewritten: consenting to a transfer appends exactly one
+/// [`SenderTransferRecord`]. That is what lets an auditor answer "who funded
+/// this deposit?" after several hops, which the mutable `Stream::sender` field
+/// alone cannot.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SenderHistory {
+    pub stream_id: u64,
+    pub sender_at_creation: Address,
+    pub transfers: Vec<SenderTransferRecord>,
+}
+
 /// Lifecycle state of a stream.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -267,6 +329,19 @@ pub enum DataKey {
     /// The pending two-step ownership proposal for the given stream, if any.
     /// At most one proposal exists per stream at a time.
     PendingOwnership(u64),
+    /// The pending recipient-consented sender transfer for the given stream.
+    /// Kept outside [`Stream`] so proposing changes no accounting field, and
+    /// so the record layout tag of a stream is untouched by role plumbing.
+    PendingSenderTransfer(u64),
+    /// Append-only sender-role transfer log for the given stream. Absent until
+    /// the first transfer executes for that stream, which is also when
+    /// `sender_at_creation` is fixed.
+    SenderHistory(u64),
+    /// The address whose deposit-backed claim receives cancellation refunds for
+    /// the given stream. Absent means "the current sender"; the key is written
+    /// only when the answer must differ from that, which keeps reads of
+    /// untouched streams free of extra storage.
+    RefundTarget(u64),
 }
 
 /// Seconds elapsed of the stream window at the given timestamp `now`.
@@ -515,6 +590,13 @@ pub fn index_sender(env: &Env, sender: &Address, id: u64) {
     push_to_index(env, &DataKey::SenderStreams(sender.clone()), id);
 }
 
+/// Drops `id` from a sender's discovery index — the prune half of a sender-role
+/// transfer, so the outgoing sender's listing stops offering a stream they no
+/// longer control while the incoming sender's starts offering it.
+pub fn unindex_sender(env: &Env, sender: &Address, id: u64) {
+    remove_from_index(env, &DataKey::SenderStreams(sender.clone()), id);
+}
+
 /// Appends `id` to the recipient's discovery index. Called on creation and
 /// when an accepted ownership transfer installs a new recipient.
 pub fn index_recipient(env: &Env, recipient: &Address, id: u64) {
@@ -550,6 +632,161 @@ pub fn remove_pending_ownership(env: &Env, id: u64) {
         .remove(&DataKey::PendingOwnership(id));
 }
 
+/// Loads the pending sender transfer for `id`, if one exists, and extends its
+/// storage TTL (the same read-then-extend shape as [`get_pending_ownership`]:
+/// extending a key that is absent fails).
+pub fn get_pending_sender_transfer(env: &Env, id: u64) -> Option<PendingSenderTransfer> {
+    #[cfg(test)]
+    crate::cei_trace::record(&std::format!("read persistent PendingSenderTransfer({id})"));
+    let key = DataKey::PendingSenderTransfer(id);
+    let storage = env.storage().persistent();
+    let pending: PendingSenderTransfer = storage.get(&key)?;
+    storage.extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);
+    Some(pending)
+}
+
+/// Persists a pending sender transfer and extends its storage TTL.
+pub fn put_pending_sender_transfer(env: &Env, pending: &PendingSenderTransfer) {
+    #[cfg(test)]
+    crate::cei_trace::record(&std::format!(
+        "write persistent PendingSenderTransfer({})",
+        pending.stream_id
+    ));
+    let key = DataKey::PendingSenderTransfer(pending.stream_id);
+    env.storage().persistent().set(&key, pending);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);
+}
+
+/// Removes a pending sender transfer. No-op if none exists.
+pub fn remove_pending_sender_transfer(env: &Env, id: u64) {
+    #[cfg(test)]
+    crate::cei_trace::record(&std::format!(
+        "remove persistent PendingSenderTransfer({id})"
+    ));
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingSenderTransfer(id));
+}
+
+/// The address whose refund claim the remaining deposit belongs to.
+///
+/// Falls back to `stream.sender` when no explicit target is stored, so every
+/// stream that never had a role change or a refund amendment keeps today's
+/// behavior with no extra storage read cost in layout terms.
+pub fn refund_target(env: &Env, stream: &Stream) -> Address {
+    let key = DataKey::RefundTarget(stream.id);
+    let storage = env.storage().persistent();
+    if let Some(target) = storage.get::<DataKey, Address>(&key) {
+        storage.extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);
+        return target;
+    }
+    stream.sender.clone()
+}
+
+/// Pins the refund claim of `id` to `target`.
+pub fn put_refund_target(env: &Env, id: u64, target: &Address) {
+    #[cfg(test)]
+    crate::cei_trace::record(&std::format!("write persistent RefundTarget({id})"));
+    let key = DataKey::RefundTarget(id);
+    env.storage().persistent().set(&key, target);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);
+}
+
+/// The sender-role log for one stream.
+///
+/// A stream whose role has never moved has no log: the view then reports the
+/// current sender as `sender_at_creation` with an empty history, which is what
+/// the append-only log would have been seeded with.
+pub fn sender_history(env: &Env, stream: &Stream) -> SenderHistory {
+    get_sender_history(env, stream)
+}
+
+fn get_sender_history(env: &Env, stream: &Stream) -> SenderHistory {
+    let key = DataKey::SenderHistory(stream.id);
+    let storage = env.storage().persistent();
+    if let Some(history) = storage.get::<DataKey, SenderHistory>(&key) {
+        storage.extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);
+        return history;
+    }
+    SenderHistory {
+        stream_id: stream.id,
+        sender_at_creation: stream.sender.clone(),
+        transfers: Vec::new(env),
+    }
+}
+
+/// Appends one executed transfer to the stream's log. The existing entries are
+/// copied unchanged — the log is append-only, never rewritten.
+fn append_sender_history(env: &Env, stream: &Stream, record: &SenderTransferRecord) {
+    #[cfg(test)]
+    crate::cei_trace::record(&std::format!(
+        "write persistent SenderHistory({})",
+        stream.id
+    ));
+    let key = DataKey::SenderHistory(stream.id);
+    let mut history = get_sender_history(env, stream);
+    history.transfers.push_back(record.clone());
+    env.storage().persistent().set(&key, &history);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);
+}
+
+/// Executes a consented sender transfer: the role moves to `new_sender`, the
+/// discovery indexes are re-pointed, the refund claim follows only when the
+/// proposal said it should, and the transfer is appended to the immutable log.
+///
+/// The caller has already checked consent, nonce and expiry; this is the
+/// effects half, kept separate so the CEI order (reads, then state writes, then
+/// the event, then nothing) is readable in one place.
+pub fn apply_sender_transfer(
+    env: &Env,
+    stream: &Stream,
+    pending: &PendingSenderTransfer,
+) -> Result<Stream, StreamError> {
+    let previous_target = refund_target(env, stream);
+    let mut updated = stream.clone();
+    updated.sender = pending.new_sender.clone();
+    put_stream(env, &updated);
+
+    // Index migration for the one hop: the outgoing sender's discovery page
+    // stops listing the stream, the incoming sender's starts listing it, and
+    // both pages get their TTL extended by the write (`index_sender` and
+    // `unindex_sender` share the same append/prune helpers).
+    unindex_sender(env, &pending.sender_from, updated.id);
+    index_sender(env, &pending.new_sender, updated.id);
+
+    // Refund rights move only on purpose: an amendment that did not ask for it
+    // pins the claim to whatever it was before the hop — the original sender's.
+    put_refund_target(
+        env,
+        updated.id,
+        if pending.transfer_refund_rights {
+            &pending.new_sender
+        } else {
+            &previous_target
+        },
+    );
+
+    append_sender_history(
+        env,
+        stream,
+        &SenderTransferRecord {
+            sender_from: pending.sender_from.clone(),
+            sender_to: pending.new_sender.clone(),
+            nonce: pending.nonce,
+            at: env.ledger().timestamp(),
+            refund_rights_transferred: pending.transfer_refund_rights,
+        },
+    );
+
+    Ok(updated)
+}
+
 pub(crate) fn push_to_index(env: &Env, key: &DataKey, id: u64) {
     let mut ids: Vec<u64> = env
         .storage()
@@ -561,6 +798,36 @@ pub(crate) fn push_to_index(env: &Env, key: &DataKey, id: u64) {
     env.storage()
         .persistent()
         .extend_ttl(key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);
+}
+
+/// Removes the first occurrence of `id` from an address index, sharing
+/// [`push_to_index`]'s read-modify-write-and-extend shape.
+///
+/// Returns false when the address has no index entry or never listed `id`, and
+/// leaves storage untouched in that case. Order of the remaining ids is
+/// preserved, so an index page stays in creation order after a prune.
+pub(crate) fn remove_from_index(env: &Env, key: &DataKey, id: u64) -> bool {
+    let storage = env.storage().persistent();
+    let Some(ids): Option<Vec<u64>> = storage.get(key) else {
+        return false;
+    };
+    let mut kept: Vec<u64> = Vec::new(env);
+    let mut pruned = false;
+    for index in 0..ids.len() {
+        let Some(value) = ids.get(index) else {
+            continue;
+        };
+        if !pruned && value == id {
+            pruned = true;
+            continue;
+        }
+        kept.push_back(value);
+    }
+    if pruned {
+        storage.set(key, &kept);
+        storage.extend_ttl(key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);
+    }
+    pruned
 }
 
 /// Returns one page of stream ids from an address index, in creation order.

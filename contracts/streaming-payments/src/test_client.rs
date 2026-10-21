@@ -11,8 +11,9 @@
 use soroban_sdk::{contractclient, Address, BytesN, Env, Vec};
 
 use crate::{
-    BatchEntry, FeeScan, MigrationStatus, PendingOwnership, PendingUpgrade, PeriodSpend,
-    ScheduledIntent, SponsorConfig, Stream, StreamError, StreamInput, StreamPolicy, TreasuryStatus,
+    BatchEntry, FeeScan, MigrationStatus, PendingOwnership, PendingSenderTransfer, PendingUpgrade,
+    PeriodSpend, ScheduledIntent, SenderHistory, SponsorConfig, Stream, StreamError, StreamInput,
+    StreamPolicy, TreasuryStatus,
 };
 
 /// Interface of the StreamPay streaming-payments contract.
@@ -203,6 +204,25 @@ pub trait StreamingPaymentsApi {
         env: Env,
         stream_id: u64,
     ) -> Result<crate::StreamVersionReport, StreamError>;
+    #[allow(clippy::too_many_arguments)]
+    fn propose_sender_transfer(
+        env: Env,
+        caller: Address,
+        stream_id: u64,
+        new_sender: Address,
+        nonce: u64,
+        transfer_refund_rights: bool,
+    ) -> Result<(), StreamError>;
+    fn accept_sender_transfer(
+        env: Env,
+        caller: Address,
+        stream_id: u64,
+        nonce: u64,
+    ) -> Result<(), StreamError>;
+    fn expire_sender_transfer(env: Env, stream_id: u64) -> Result<u64, StreamError>;
+    fn pending_sender_transfer(env: Env, stream_id: u64) -> Option<PendingSenderTransfer>;
+    fn sender_history(env: Env, stream_id: u64) -> Result<SenderHistory, StreamError>;
+    fn refund_target(env: Env, stream_id: u64) -> Result<Address, StreamError>;
     fn set_oracle_config(
         env: Env,
         caller: Address,

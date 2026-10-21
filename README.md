@@ -78,9 +78,15 @@ Metrics, alerting stack, and operational diagnosis: [`docs/RUNBOOK.md`](./docs/R
 | `propose_ownership_transfer(caller, stream_id, new_owner)` | sender or recipient | — (records a pending target) | `OwnershipProposed` |
 | `accept_ownership_transfer(caller, stream_id)` | named `new_owner` only | — (moves the role) | `OwnershipAccepted` |
 | `cancel_ownership_transfer(caller, stream_id)` | proposer only | — (clears the pending target) | — |
+| `propose_sender_transfer(caller, stream_id, new_sender, nonce, transfer_refund_rights)` | current sender | — (records a pending proposal) | `SenderTransferProposed` |
+| `accept_sender_transfer(caller, stream_id, nonce)` | recipient only | — (moves the payer role) | `SenderTransferred` |
+| `expire_sender_transfer(stream_id) → u64` | anyone, after the window | — (clears a dead proposal) | `SenderTransferExpired` |
 | `get_stream(stream_id) → Stream` | — (read-only) | — | — |
 | `available(stream_id) → i128` | — (read-only) | — | — |
 | `pending_ownership_transfer(stream_id) → Option<PendingOwnership>` | — (read-only) | — | — |
+| `pending_sender_transfer(stream_id) → Option<PendingSenderTransfer>` | — (read-only) | — | — |
+| `sender_history(stream_id) → SenderHistory` | — (read-only) | — | — |
+| `refund_target(stream_id) → Address` | — (read-only) | — | — |
 | `recipient_streams(address, offset, limit) → Vec<u64>` | — (read-only) | — | — |
 | `sender_streams(address, offset, limit) → Vec<u64>` | — (read-only) | — | — |
 | `schedule_stream(sender, recipient, token, deposit, start, end, cancelable, interval, occurrences, fee_budget, execute_after, expires_at) → u64` | anyone (sender auth required) | pulls `(deposit+fee)×occurrences` in | `StreamScheduled` |
@@ -124,7 +130,9 @@ read each stream's `status` for lifecycle state. Ownership transfers follow
 the same append-only rule: the new holder's index gains the id on acceptance
 and the previous holder keeps its historical entry, so readers must check the
 current `sender` / `recipient` fields on `get_stream` before acting on an
-indexed id.
+indexed id. A consented **sender-role transfer** (#201) is the exception: it
+re-points the payer index on both sides, so the outgoing sender's page stops
+listing the stream and the incoming sender's starts listing it.
 
 ### Two-step ownership transfer
 
@@ -142,6 +150,37 @@ after a transfer — only the destination of future claims (recipient) or future
 top-ups/cancellation refunds (sender) changes. See
 [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §17 for the full invariant
 proof sketch.
+
+### Consented sender-role transfer
+
+`propose_ownership_transfer` hands a role to the address that will hold it, so
+the target consents. A **sender-role transfer** is the other case: the payer
+changes, and the party who loses their counterparty is the recipient, so the
+*recipient* consents.
+
+1. The current sender calls `propose_sender_transfer(stream_id, new_sender,
+   nonce, transfer_refund_rights)`, which stores a proposal with the same
+   7-day window. The stream is unchanged; a second proposal is refused while
+   one is live (`SenderTransferPending`, code 69).
+2. The stream's recipient — and only the recipient — calls
+   `accept_sender_transfer(stream_id, nonce)` with that nonce. Any other
+   caller gets `SenderTransferNotConsenter` (70); a nonce that is not the
+   stored one gets `SenderTransferNonceMismatch` (68), so a replaced proposal
+   can never be executed with a stale consent.
+3. If the window lapses, the proposal cannot execute (`SenderTransferExpired`,
+   66) and anyone may reclaim the storage with
+   `expire_sender_transfer(stream_id)` (67 while it is still live), which
+   returns the nonce it removed.
+
+Only `sender` moves: deposit, `withdrawn`, token and window are untouched, so
+accrual is identical before and after a hop. Every executed hop is appended to
+the stream's immutable `SenderHistory` log, whose `sender_at_creation` keeps
+answering "who funded this deposit?" however many roles pass by. The refund
+claim of the original deposit is **not** implied by the role change: it stays
+with whoever held it unless the proposal sets `transfer_refund_rights`, and
+`refund_target(stream_id)` always reports where the cancellation remainder
+would go. Both discovery index pages are rewritten and TTL-extended by the
+same shared index writers the creation path uses.
 
 Any SEP-41-compatible asset can fund a stream: an issued asset via its
 Stellar Asset Contract id (e.g. USDC on testnet) or **native XLM** via its
