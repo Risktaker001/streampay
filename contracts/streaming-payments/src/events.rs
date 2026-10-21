@@ -475,3 +475,23 @@ pub struct SenderTransferExpired {
     pub new_sender: Address,
     pub nonce: u64,
 }
+
+/// Emitted whenever the refund claim of a stream is pinned to a new address —
+/// at creation (`create_stream_with_refund`) or later by the sender
+/// (`set_refund_target`). The unstreamed remainder of the deposit is paid to
+/// `new_target` on cancellation instead of to the sender. Accrual, the
+/// recipient's claims and who may cancel are untouched: this is a destination
+/// change, not a value change.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamRefundTargetChanged {
+    #[topic]
+    pub stream_id: u64,
+    /// The address that held the claim before this change: the previous
+    /// `new_target`, or the sender on the first routing of a stream.
+    pub previous_target: Address,
+    pub new_target: Address,
+    /// True when the routing was set by `create_stream_with_refund`, so a
+    /// reader can tell a creation-time destination from a later amendment.
+    pub at_creation: bool,
+}

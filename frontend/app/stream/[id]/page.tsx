@@ -10,6 +10,7 @@ import {
   isNativeXlm,
   readAvailable,
   readBeneficiaryKey,
+  readRefundTarget,
   readSponsor,
   readStream,
   RELAY_URL,
@@ -63,6 +64,7 @@ export default function StreamDetail() {
   const [refreshing, setRefreshing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [discoveryModalOpen, setDiscoveryModalOpen] = useState<boolean>(false);
+  const [refundTarget, setRefundTarget] = useState<string | null>(null);
 
   const reload = useCallback(async () => {
     if (!id) return;
@@ -71,6 +73,8 @@ export default function StreamDetail() {
       const [s, a] = await Promise.all([readStream(id), readAvailable(id)]);
       setStream(s);
       setAvailable(a);
+      // Separate, non-fatal read: the routing only annotates the cancel card.
+      setRefundTarget(await readRefundTarget(id));
       fetchAssetMeta(s.token).then((meta) => setAssetMeta(meta));
       setSnapshot({
         deposit: BigInt(s.deposit),
@@ -570,6 +574,16 @@ export default function StreamDetail() {
               Pays the recipient everything accrued and refunds the sender the
               rest, atomically. This is irreversible.
             </p>
+            {refundTarget !== null && refundTarget !== stream.sender && (
+              <p className="warn" role="note">
+                <span aria-hidden="true">⚠</span>
+                <span>
+                  Warning: the refund of the remainder is routed to{" "}
+                  <code>{refundTarget}</code>, not to the current sender. The
+                  sender role and who can cancel are unaffected.
+                </span>
+              </p>
+            )}
             <button onClick={() => void doCancel()} disabled={submitting}>
               {submitting ? "Cancelling…" : "Cancel stream"}
             </button>

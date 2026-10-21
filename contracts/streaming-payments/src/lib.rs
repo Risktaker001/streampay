@@ -21,6 +21,9 @@
 //!   [`StreamingPayments::accept_ownership_transfer`] /
 //!   [`StreamingPayments::cancel_ownership_transfer`] — two-step handoff of
 //!   the sender (payer) or recipient (claimant) role
+//! - [`StreamingPayments::create_stream_with_refund`] /
+//!   [`StreamingPayments::set_refund_target`] — route the refund of the
+//!   unstreamed remainder to an address other than the sender
 //! - [`StreamingPayments::sponsored_withdraw`] — an operator relays a
 //!   recipient's claim and a sponsor absorbs the gas, guarded by a budget
 //!   ledger and nonce replay protection (see the `sponsor` module docs)
@@ -101,8 +104,8 @@ pub use events::{
     ScheduledIntentCancelled, ScheduledIntentExpired, ScheduledStreamExecuted,
     SenderTransferExpired, SenderTransferProposed, SenderTransferred, SponsorActiveSet,
     SponsorClaim, SponsorRegistered, StorageMigrated, StreamCancelled, StreamCreated,
-    StreamPolicySet, StreamRecordMigrated, StreamScheduled, StreamToppedUp, StreamsCreated,
-    UpgradeCancelled, UpgradeProposed, Withdrawn,
+    StreamPolicySet, StreamRecordMigrated, StreamRefundTargetChanged, StreamScheduled,
+    StreamToppedUp, StreamsCreated, UpgradeCancelled, UpgradeProposed, Withdrawn,
 };
 pub use oracle::{OracleConfig, OracleReport, ResolvedTime, DEFAULT_MAX_STALE_SECONDS};
 pub use policy::{validate_stream_args, validate_top_up_args, QueuedAssetChange, StreamPolicy};
@@ -394,6 +397,128 @@ impl StreamingPayments {
         }
 
         Ok(id)
+    }
+
+    /// Creates a stream whose unstreamed remainder is refundable to `refund_to`
+    /// rather than to the sender.
+    ///
+    /// The refund claim normally travels with the sender role; pinning it at
+    /// creation is how a payer routes a cancellation back to the account that
+    /// actually funded the deposit — a treasury behind the signing key, a
+    /// corporate payer whose payroll wallet is ephemeral, or a parent grant that
+    /// must reclaim what its beneficiary's stream never spent. Accrual, the
+    /// recipient's claims and `cancel_stream`'s authorization are untouched: only
+    /// the destination of the *remainder* changes, so
+    /// `0 <= withdrawn <= streamed <= deposit` and the conservation invariant are
+    /// identical to [`StreamingPayments::create_stream`].
+    ///
+    /// `refund_to` must differ from `sender` — that is already where the claim
+    /// sits, and refusing the no-op keeps the event log to real routing changes.
+    /// The address is *not* required to exist, hold a balance, or be able to
+    /// receive: routing to an address that cannot accept the transfer surfaces
+    /// later as [`StreamError::SenderRefundFailed`] on the cancellation, so this
+    /// is the sender's own risk to take, and the reason the choice is announced
+    /// by `StreamRefundTargetChanged` rather than stored silently.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_stream_with_refund(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        deposit_amount: i128,
+        start_time: u64,
+        end_time: u64,
+        cancelable: bool,
+        refund_to: Address,
+    ) -> Result<u64, StreamError> {
+        Self::require_not_frozen(&env)?;
+        if refund_to == sender {
+            return Err(surface::reject(Branch::RefundTargetUnchanged));
+        }
+
+        // The deposit, the escrow and every creation check are the plain
+        // creation path; nothing about routing changes them.
+        let id = Self::create_stream_with_oracle(
+            env.clone(),
+            sender.clone(),
+            recipient,
+            token,
+            deposit_amount,
+            start_time,
+            end_time,
+            cancelable,
+            false,
+        )?;
+
+        // Effects, then the event — same CEI shape as the amendment path. No
+        // token moves here: the deposit is already escrowed in the contract.
+        stream::put_refund_target(&env, id, &refund_to);
+
+        #[cfg(test)]
+        cei_trace::record("event StreamRefundTargetChanged");
+        StreamRefundTargetChanged {
+            stream_id: id,
+            previous_target: sender,
+            new_target: refund_to,
+            at_creation: true,
+        }
+        .publish(&env);
+
+        Ok(id)
+    }
+
+    /// Re-routes the refund of a stream's unstreamed remainder to `refund_to`.
+    ///
+    /// Only the current sender may call this, and only while the stream is
+    /// `Active`: the claim is the counterpart of the money that funded the
+    /// stream, so nobody else gets to redirect it, and once the stream is
+    /// cancelled or depleted there is no remainder left to route.
+    ///
+    /// Routing to the sender's own address is the way to *undo* a previous
+    /// routing (or to make a routed claim follow the role again), and is a real
+    /// change whenever the pinned target differs from the current sender — see
+    /// [`StreamingPayments::refund_target`].
+    ///
+    /// The claim is deliberately *not* re-derived from the role on every hop: a
+    /// consented sender transfer keeps whatever routing was in force, which is
+    /// why [`StreamingPayments::propose_sender_transfer`] carries an explicit
+    /// `transfer_refund_rights` flag instead of implying one here. A top-up by a
+    /// later sender therefore enlarges the pot that the *pinned* target reclaims
+    /// — route with intent.
+    pub fn set_refund_target(
+        env: Env,
+        caller: Address,
+        stream_id: u64,
+        refund_to: Address,
+    ) -> Result<(), StreamError> {
+        Self::require_not_frozen(&env)?;
+        caller.require_auth();
+
+        let s = stream::get_stream(&env, stream_id)?;
+        if s.status != StreamStatus::Active {
+            return Err(surface::reject(Branch::StreamNotActive));
+        }
+        if caller != s.sender {
+            return Err(surface::reject(Branch::RefundTargetNotSender));
+        }
+        let previous = stream::refund_target(&env, &s);
+        if previous == refund_to {
+            return Err(surface::reject(Branch::RefundTargetUnchanged));
+        }
+
+        stream::put_refund_target(&env, stream_id, &refund_to);
+
+        #[cfg(test)]
+        cei_trace::record("event StreamRefundTargetChanged");
+        StreamRefundTargetChanged {
+            stream_id,
+            previous_target: previous,
+            new_target: refund_to,
+            at_creation: false,
+        }
+        .publish(&env);
+
+        Ok(())
     }
 
     fn validate_stream_creation(

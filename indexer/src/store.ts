@@ -33,6 +33,7 @@ export class StreamStore {
         deposit TEXT, withdrawn TEXT NOT NULL DEFAULT '0', start_time TEXT,
         end_time TEXT, cancelable INTEGER, status TEXT NOT NULL DEFAULT 'active',
         cancelled_by TEXT, recipient_amount TEXT, sender_amount TEXT,
+        refund_target TEXT,
         last_ledger INTEGER NOT NULL, updated_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS streams_sender ON streams(sender, stream_id);
@@ -53,6 +54,12 @@ export class StreamStore {
     } catch {}
     try {
       this.db.exec("ALTER TABLE events ADD COLUMN span_id TEXT;");
+    } catch {}
+    // Refund routing (#204): the address the unstreamed remainder is paid to,
+    // when it is not the stream's sender. A database created before this column
+    // gets it added on open; `NULL` means "unrouted — the sender is paid".
+    try {
+      this.db.exec("ALTER TABLE streams ADD COLUMN refund_target TEXT;");
     } catch {}
     this.webhooks = new WebhookStore(this.db);
     this.outbox = new OutboxStore(this.db);
@@ -218,6 +225,13 @@ export class StreamStore {
         }
         case "stream_paused": patch.status = "paused"; break;
         case "stream_resumed": patch.status = "active"; break;
+        // Refund routing changes only where the unstreamed remainder is paid.
+        // Accrual, the recipient and the sender role are untouched, so nothing
+        // else in the row is patched — and the routing is not a discoverable
+        // role, so it never enters `listAddress`.
+        case "stream_refund_target_changed":
+          patch.refund_target = get("new_target");
+          break;
         // The event is still journalled; only the projection ignores it.
         default:
           dbSpan.setStatus("OK");
@@ -241,6 +255,7 @@ export class StreamStore {
         cancelled_by: patch.cancelled_by ?? current.cancelled_by ?? null,
         recipient_amount: patch.recipient_amount ?? current.recipient_amount ?? null,
         sender_amount: patch.sender_amount ?? current.sender_amount ?? null,
+        refund_target: patch.refund_target ?? current.refund_target ?? null,
         last_ledger: event.ledger,
         updated_at: event.ledgerClosedAt,
       };
@@ -251,12 +266,12 @@ export class StreamStore {
       // rewind status/deposit/withdrawn. Events in the same ledger as the
       // current state still apply (>=), because one ledger can hold several
       // events for one stream and they must land in order within it.
-      const upsert = this.db.prepare(`INSERT INTO streams(stream_id,sender,recipient,token,deposit,withdrawn,start_time,end_time,cancelable,status,cancelled_by,recipient_amount,sender_amount,last_ledger,updated_at)
-        VALUES(@stream_id,@sender,@recipient,@token,@deposit,@withdrawn,@start_time,@end_time,@cancelable,@status,@cancelled_by,@recipient_amount,@sender_amount,@last_ledger,@updated_at)
+      const upsert = this.db.prepare(`INSERT INTO streams(stream_id,sender,recipient,token,deposit,withdrawn,start_time,end_time,cancelable,status,cancelled_by,recipient_amount,sender_amount,refund_target,last_ledger,updated_at)
+        VALUES(@stream_id,@sender,@recipient,@token,@deposit,@withdrawn,@start_time,@end_time,@cancelable,@status,@cancelled_by,@recipient_amount,@sender_amount,@refund_target,@last_ledger,@updated_at)
         ON CONFLICT(stream_id) DO UPDATE SET sender=excluded.sender, recipient=excluded.recipient, token=excluded.token,
         deposit=excluded.deposit, withdrawn=excluded.withdrawn, start_time=excluded.start_time, end_time=excluded.end_time,
         cancelable=excluded.cancelable, status=excluded.status, cancelled_by=excluded.cancelled_by,
-        recipient_amount=excluded.recipient_amount, sender_amount=excluded.sender_amount,
+        recipient_amount=excluded.recipient_amount, sender_amount=excluded.sender_amount, refund_target=excluded.refund_target,
         last_ledger=excluded.last_ledger, updated_at=excluded.updated_at
         WHERE excluded.last_ledger >= streams.last_ledger`).run(row);
 
@@ -320,6 +335,8 @@ export class StreamStore {
       cancelled_by: (row.cancelled_by as string | null) ?? undefined,
       recipient_amount: (row.recipient_amount as string | null) ?? undefined,
       sender_amount: (row.sender_amount as string | null) ?? undefined,
+      // null == unrouted: the cancel refund goes to the sender.
+      refund_target: (row.refund_target as string | null) ?? undefined,
       lastLedger: Number(row.last_ledger),
       updatedAt: String(row.updated_at),
     };

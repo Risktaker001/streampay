@@ -198,6 +198,16 @@ button:focus-visible {
   white-space: pre-wrap;
 }
 
+/* Warning that never relies on colour alone: the text spells it out, so the
+ * amber is decoration rather than the message. */
+.warn {
+  color: var(--amber);
+  font-size: 13px;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
 .ok {
   color: var(--green);
   font-size: 13px;

@@ -43,6 +43,24 @@ pub trait StreamingPaymentsApi {
         cancelable: bool,
         use_oracle: bool,
     ) -> Result<u64, StreamError>;
+    #[allow(clippy::too_many_arguments)]
+    fn create_stream_with_refund(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        deposit_amount: i128,
+        start_time: u64,
+        end_time: u64,
+        cancelable: bool,
+        refund_to: Address,
+    ) -> Result<u64, StreamError>;
+    fn set_refund_target(
+        env: Env,
+        caller: Address,
+        stream_id: u64,
+        refund_to: Address,
+    ) -> Result<(), StreamError>;
     fn create_streams(
         env: Env,
         sender: Address,

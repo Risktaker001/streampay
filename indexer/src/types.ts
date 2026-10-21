@@ -46,6 +46,7 @@ export interface Stream {
   cancelled_by?: string | null;
   recipient_amount?: string | null;
   sender_amount?: string | null;
+  refund_target?: string | null;
   lastLedger: number;
   updatedAt: string;
 }

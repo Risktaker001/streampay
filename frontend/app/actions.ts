@@ -3,6 +3,7 @@
 import {
   fetchStreamIdsPage,
   readAvailable,
+  readRefundTarget,
   readStream,
   readStreamPolicy,
 } from "@/lib/stellar-read";
@@ -19,6 +20,10 @@ export async function readStreamAction(streamId: string) {
 
 export async function readAvailableAction(streamId: string) {
   return (await readAvailable(streamId)).toString();
+}
+
+export async function readRefundTargetAction(streamId: string) {
+  return readRefundTarget(streamId);
 }
 
 export async function fetchStreamIdsPageAction(

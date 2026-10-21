@@ -217,13 +217,20 @@ pub enum Branch {
     SenderTransferPending,
     /// `accept_sender_transfer`: the caller is not the stream's recipient.
     SenderTransferNotConsenter,
+    // ------------------------------------------------ refund routing
+    /// `set_refund_target`: the caller is not the stream's current sender, so
+    /// they cannot re-route a deposit they did not fund.
+    RefundTargetNotSender,
+    /// `create_stream_with_refund` / `set_refund_target`: the address already
+    /// holds the refund claim, so the routing changes nothing.
+    RefundTargetUnchanged,
 }
 
 impl Branch {
     /// Every branch, in declaration order. The matrix test walks this list and
     /// the coverage test requires each [`StreamError`] variant to be produced by
     /// one of these (or retired).
-    pub const ALL: [Branch; 84] = [
+    pub const ALL: [Branch; 86] = [
         Branch::CreateDepositNonPositive,
         Branch::CreateStartTimeInPast,
         Branch::CreateInvalidTimeRange,
@@ -308,6 +315,8 @@ impl Branch {
         Branch::SenderTransferNonceMismatch,
         Branch::SenderTransferPending,
         Branch::SenderTransferNotConsenter,
+        Branch::RefundTargetNotSender,
+        Branch::RefundTargetUnchanged,
     ];
 
     /// The entrypoint(s) through which this branch can fire. Shared helpers
@@ -340,8 +349,11 @@ impl Branch {
                 "accept_ownership_transfer",
                 "propose_sender_transfer",
                 "accept_sender_transfer",
+                "set_refund_target",
                 "stream_record_version",
                 "migrate_stream_version",
+                "refund_target",
+                "sender_history",
             ],
             Branch::StreamNotActive => &[
                 "withdraw",
@@ -353,6 +365,7 @@ impl Branch {
                 "accept_ownership_transfer",
                 "propose_sender_transfer",
                 "accept_sender_transfer",
+                "set_refund_target",
             ],
             Branch::CapacityOverflow => &["create_stream", "top_up"],
             Branch::RateProductOverflow => &[
@@ -441,6 +454,8 @@ impl Branch {
                 "propose_sender_transfer",
                 "accept_sender_transfer",
                 "expire_sender_transfer",
+                "set_refund_target",
+                "create_stream_with_refund",
                 "migrate_stream_version",
             ],
             Branch::MigrationNotFrozen | Branch::AlreadyMigrated => &["migrate_storage"],
@@ -486,6 +501,8 @@ impl Branch {
             Branch::SenderTransferNotExpired => &["expire_sender_transfer"],
             Branch::SenderTransferPending => &["propose_sender_transfer"],
             Branch::SenderTransferNotConsenter => &["accept_sender_transfer"],
+            Branch::RefundTargetNotSender => &["set_refund_target"],
+            Branch::RefundTargetUnchanged => &["create_stream_with_refund", "set_refund_target"],
         }
     }
 
@@ -580,6 +597,8 @@ impl Branch {
             Branch::SenderTransferNonceMismatch => StreamError::SenderTransferNonceMismatch,
             Branch::SenderTransferPending => StreamError::SenderTransferPending,
             Branch::SenderTransferNotConsenter => StreamError::SenderTransferNotConsenter,
+            Branch::RefundTargetNotSender => StreamError::RefundTargetNotSender,
+            Branch::RefundTargetUnchanged => StreamError::RefundTargetUnchanged,
         }
     }
 
@@ -747,6 +766,12 @@ impl Branch {
             }
             Branch::SenderTransferNotConsenter => {
                 "the caller is not the stream's recipient"
+            }
+            Branch::RefundTargetNotSender => {
+                "the caller is not the stream's current sender, so they do not own the deposit being routed"
+            }
+            Branch::RefundTargetUnchanged => {
+                "the address already holds the refund claim, so routing to it changes nothing"
             }
         }
     }

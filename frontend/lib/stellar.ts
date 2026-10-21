@@ -831,6 +831,17 @@ export async function readAvailable(streamId: string): Promise<bigint> {
   return BigInt(scValToNative(retval) as bigint);
 }
 
+/**
+ * The address that would receive the unstreamed remainder on cancel (issue
+ * #204). Equal to the sender unless the claim was routed somewhere else, which
+ * is why the UI compares the two rather than checking for a missing key.
+ * `null` means the read failed, so a caller must not claim anything about it.
+ */
+export async function readRefundTarget(streamId: string): Promise<string | null> {
+  const retval = await simulateRead(CONTRACT_ID, "refund_target", [u64(streamId)]);
+  return retval ? String(scValToNative(retval)) : null;
+}
+
 const MAX_PAGE_SIZE = 50; // mirrors the contract's MAX_PAGE_SIZE
 
 /**

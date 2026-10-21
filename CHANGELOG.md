@@ -76,6 +76,24 @@ interface: they are only ever appended to, never renumbered or reused.
   assert after every step that the proposal slot, the role, the append-only log,
   the refund claim, the escrow balance and every address index agree with an
   independent model. Documented in `docs/ARCHITECTURE.md` §18.
+- **Refund routing**: `create_stream_with_refund(…, refund_to)` pins the
+  remainder destination at creation and `set_refund_target(stream_id, refund_to)`
+  amends it later — sender-role holder only, active streams only, and routing to
+  the address that already holds the claim is refused as a no-op
+  (`RefundTargetUnchanged`). The routing changes *where cancellation money goes*
+  and nothing else: it grants no authority (the new holder still cannot cancel,
+  top up or withdraw), it never enters the accrual math (a routed and an
+  unrouted twin stream produce identical records and identical remainders), and
+  `cancel_stream` pays the routed address with the same CEI ordering and the same
+  conservation identity as before. Amendments overwrite the single
+  `DataKey::RefundTarget(id)` key, so storage grows by at most one address per
+  routed stream rather than per amendment. Append-only:
+  `StreamRefundTargetChanged { previous_target, new_target, at_creation }`,
+  `StreamError::RefundTargetNotSender` (71) and `RefundTargetUnchanged` (72).
+  The indexer projects the routing into `streams.refund_target`, the stream
+  detail page warns when the destination differs from the sender, and randomised
+  route/cancel/transfer sequences are fuzzed against an independent model.
+  Documented in `docs/ARCHITECTURE.md` §19.
 - Frontend (opt-in) **fee-aware claim scheduling**: a recipient can queue a
   signed `withdraw_max` intent and have the client submit it when the Soroban
   inclusion-fee percentile drops under a budget, with a deadline fallback so a

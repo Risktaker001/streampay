@@ -241,6 +241,22 @@ describe("Stream detail", () => {
     const violations = await runAxe(html);
     assertNoViolations(violations, "Stream detail");
   });
+
+  // The routed-refund warning (issue #204) is the one piece of the cancel card
+  // that only appears on some streams, so it gets its own fixture.
+  test("routed refund warning passes WCAG 2.1 AA", async () => {
+    const html = withLayout(`
+<section class="card" aria-labelledby="cancel-heading">
+  <h2 id="cancel-heading">Cancel stream</h2>
+  <p class="muted">Pays the recipient everything accrued and refunds the sender the rest, atomically. This is irreversible.</p>
+  <p id="refund-warning" class="warn" role="note"><span aria-hidden="true">⚠</span><span>Warning: the refund of the remainder is routed to <code>GCXZROUTED…</code>, not to the current sender. The sender role and who can cancel are unaffected.</span></p>
+  <button type="button" aria-describedby="cancel-warning refund-warning">Cancel stream</button>
+  <p id="cancel-warning" class="sr-only">Warning: cancellation is permanent and cannot be undone.</p>
+</section>`);
+
+    const violations = await runAxe(html);
+    assertNoViolations(violations, "Stream detail (routed refund)");
+  });
 });
 
 // ===========================================================================

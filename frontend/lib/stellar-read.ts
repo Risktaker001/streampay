@@ -106,6 +106,17 @@ export async function readStreamRecordVersion(streamId: string): Promise<number 
   return retval ? Number(scValToNative(retval) as number) : null;
 }
 
+/**
+ * The address that receives the unstreamed remainder on cancel (issue #204), or
+ * `null` when the read failed. The contract returns the sender for an unrouted
+ * stream, so callers compare against `stream.sender` instead of testing for an
+ * absent key.
+ */
+export async function readRefundTarget(streamId: string): Promise<string | null> {
+  const retval = await simulateRead("refund_target", [u64(streamId)]);
+  return retval ? String(scValToNative(retval)) : null;
+}
+
 export async function fetchStreamIdsPage(
   address: string,
   role: "recipient" | "sender",

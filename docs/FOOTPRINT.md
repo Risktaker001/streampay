@@ -145,6 +145,16 @@ contributor:
   field would make every already-stored record undecodable — the one change
   the storage-versioning work exists to make unnecessary. A separate key costs
   CPU; a field would cost the ledger's history.
+- **Refund routing (#204).** `set_refund_target` is a read-then-overwrite of that
+  same `DataKey::RefundTarget(id)`: one stream read, one target read, one key
+  write, one event, and no token transfer — so amendments are cheaper than the
+  cancel they redirect. `create_stream_with_refund` pays ordinary creation plus
+  that single write, which is why the creation goldens and budgets are
+  unchanged: routing is delegated to the existing creation path and pinned
+  afterwards. Because every amendment overwrites the one key rather than
+  appending, storage grows by at most one address per *routed stream*, not per
+  routed amendment — the append-only growth claim is bounded by streams, and an
+  unrouted stream stores nothing at all.
 - **Storage growth is append-only and bounded per stream:** at most three extra
   keys exist for a stream that has been through the sender-transfer surface
   (`PendingSenderTransfer`, `RefundTarget`, `SenderHistory`), and each is under
@@ -160,6 +170,7 @@ Re-measured with `cargo test -p streampay-contract --lib hot_path_footprint
 | `withdraw` | 354,596 | 143,334 | +7,514 (+2.17%) |
 | `withdraw_max` | 347,710 | 138,764 | +9,047 (+2.67%) |
 | `cancel_stream` | 552,355 | 181,145 | +28,792 (+5.50%) |
+| `set_refund_target` | 140,812 | 68,410 | new path (#204), budget 160,000 |
 
 `cancel_stream` is the only path that pays both effects; the rest of the delta
 is the record envelope. Its harness budget was raised from 540,000 to

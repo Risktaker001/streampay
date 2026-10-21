@@ -1084,6 +1084,26 @@ fn probe(branch: Branch) -> Option<StreamError> {
                 .mock_all_auths()
                 .try_accept_sender_transfer(&new_sender, &id, &1)))
         }
+        // ------------------------------------------------ refund routing
+        Branch::RefundTargetNotSender => {
+            let f = Fixture::setup_quiet();
+            let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+            let stranger = soroban_sdk::Address::generate(&f.env);
+            Some(rejected!(f
+                .client
+                .mock_all_auths()
+                .try_set_refund_target(&stranger, &id, &stranger)))
+        }
+        Branch::RefundTargetUnchanged => {
+            let f = Fixture::setup_quiet();
+            let id = f.create_stream(DEPOSIT, DAY, 10 * DAY, false);
+            // The sender already holds the claim, so routing to them is the
+            // no-op this branch exists to refuse.
+            Some(rejected!(f
+                .client
+                .mock_all_auths()
+                .try_set_refund_target(&f.sender, &id, &f.sender)))
+        }
     }
 }
 
@@ -1260,7 +1280,9 @@ fn stream_error_variant_list_is_exhaustive() {
             | StreamError::SenderTransferNotExpired
             | StreamError::SenderTransferNonceMismatch
             | StreamError::SenderTransferPending
-            | StreamError::SenderTransferNotConsenter => StreamError::ALL.contains(&e),
+            | StreamError::SenderTransferNotConsenter
+            | StreamError::RefundTargetNotSender
+            | StreamError::RefundTargetUnchanged => StreamError::ALL.contains(&e),
         }
     }
 

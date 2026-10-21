@@ -211,6 +211,14 @@ pub enum StreamError {
     /// The caller is not the stream's recipient, so their consent cannot
     /// execute a sender-role transfer.
     SenderTransferNotConsenter = 70,
+    /// Only the current sender may route the refund of their deposit. The
+    /// refund claim is the counterpart of the money that funded the stream, so
+    /// a stranger cannot redirect it by calling `set_refund_target`.
+    RefundTargetNotSender = 71,
+    /// The requested refund target already holds the claim, so the amendment
+    /// would rewrite the same address and emit an event that reports no
+    /// change. Rejected so the log only ever records real routing changes.
+    RefundTargetUnchanged = 72,
 }
 
 impl StreamError {
@@ -288,6 +296,8 @@ impl StreamError {
         StreamError::SenderTransferNonceMismatch,
         StreamError::SenderTransferPending,
         StreamError::SenderTransferNotConsenter,
+        StreamError::RefundTargetNotSender,
+        StreamError::RefundTargetUnchanged,
     ];
 
     /// The stable numeric value carried across the contract boundary

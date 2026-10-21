@@ -55,7 +55,7 @@ reentrancy, TTL strategy, and the design decisions behind the v1 API. Read the
 | `DataKey::PendingOwnership(id)` | `PendingOwnership` | at most one unexpired role-proposal per stream |
 | `DataKey::PendingSenderTransfer(id)` | `PendingSenderTransfer` | at most one unexpired sender-role proposal per stream |
 | `DataKey::SenderHistory(id)` | `SenderHistory` | append-only log: sender at creation + every consented hop |
-| `DataKey::RefundTarget(id)` | `Address` | who owns the cancellation remainder; absent = the current `sender` |
+| `DataKey::RefundTarget(id)` | `Address` | who owns the cancellation remainder; absent = the current `sender`; re-pointable by the sender (§19) |
 
 Streams live in **persistent** storage. Every mutating entrypoint that touches
 a stream extends its TTL (`TTL_THRESHOLD_LEDGERS = 200_000`, extend to
@@ -856,6 +856,7 @@ Events are the off-chain ledger indexers consume; fields decode by position
 | `SenderTransferProposed` | `stream_id: u64` | `sender_from: Address`; `new_sender: Address`; `nonce: u64`; `expires_at: u64`; `transfer_refund_rights: bool` |
 | `SenderTransferred` | `stream_id: u64` | `sender_from: Address`; `sender_to: Address`; `nonce: u64`; `refund_rights_transferred: bool` |
 | `SenderTransferExpired` | `stream_id: u64` | `sender_from: Address`; `new_sender: Address`; `nonce: u64` |
+| `StreamRefundTargetChanged` | `stream_id: u64` | `previous_target: Address`; `new_target: Address`; `at_creation: bool` |
 
 Never add, remove, reorder, or retype fields of an existing event; emit a
 new event type instead. Tests must filter by contract and compare typed XDR
@@ -1135,3 +1136,76 @@ by `test_orderings/sender_transfer.txt`. `deposit`, `withdrawn`, `token`,
 `start_time`, `end_time` and `status` are untouched, so §17's invariance proof
 applies unchanged. Cost and growth are documented in
 [`FOOTPRINT.md`](./FOOTPRINT.md) (Candidate 5).
+
+## 19. Refund routing
+
+§18 established that the refund of the unstreamed remainder is a *claim*, not a
+consequence of a role. `DataKey::RefundTarget(id)` was written only as a
+side-effect of a hop. **Refund routing** makes that claim directly addressable:
+the sender-role holder can name the destination at creation, or amend it later,
+without anyone's counterparty's consent — because routing money to an address
+can only ever *give*, and the party who funded the deposit is the party entitled
+to decide where it returns.
+
+```text
+create_stream_with_refund(…, refund_to)
+      frozen                                  → ContractFrozen (36)
+      refund_to == sender                     → RefundTargetUnchanged (72)
+      then the ordinary create_stream_with_oracle checks and validation
+      writes RefundTarget(id) = refund_to on top of the fresh record
+      emits StreamCreated, then StreamRefundTargetChanged { at_creation: true }
+
+set_refund_target(caller, id, refund_to)
+      caller.require_auth()
+      frozen                                  → ContractFrozen (36)
+      stream must exist                       → StreamNotFound (1)
+      status must be Active                   → StreamNotActive (5)
+      caller must hold the sender role        → RefundTargetNotSender (71)
+      target must differ from the claim       → RefundTargetUnchanged (72)
+      overwrites RefundTarget(id); emits StreamRefundTargetChanged
+```
+
+The rejection order is deliberate and is what `error_surface_test.rs` probes:
+authorization before existence-checking would leak which ids exist to a caller
+the contract is about to refuse anyway, while `StreamNotActive` before
+`RefundTargetNotSender` keeps a stranger from learning a finished stream's
+state through an error that names them.
+
+**What routing does not do.** It grants no authority — the routed address can
+still neither cancel, top up, pause nor withdraw, and only the sender-role
+holder can move the routing again (so after a hop the outgoing sender loses the
+amendment right, which `a_routed_refund_pays_the_designated_address_and_nobody_else`
+and `only_the_current_sender_can_re_route_the_refund` hold). It does
+not touch the accrual math: `available`, `streamed`, and the split
+`cancel_amounts` computes are functions of `deposit`, `withdrawn` and the time
+window only, so a routed stream and an unrouted twin produce records that are
+equal field-for-field with different destinations for the same remainder. That
+is the property `routing_never_touches_the_accrual_math` asserts by *record
+equality*, which is stronger than asserting equal numbers: it proves the routing
+is not in the record at all.
+
+**Composition with §18.** `apply_sender_transfer` pins `RefundTarget` on every
+hop — to the incoming sender when the proposal set `transfer_refund_rights`,
+otherwise to whatever the claim already was. A routing therefore survives a hop
+that does not move rights, and is replaced by a hop that does; the last write
+wins, which is the order the parties acted in. Both orders are exercised in
+`routing_and_sender_transfers_compose_in_the_order_thappen` — see the four-cell
+interaction matrix it builds. One trap follows from this and is documented on the
+entrypoint rather than discovered in production: routing the claim to a fixed
+address, then letting a *different* sender top the stream up, means the pinned
+address drains the enlarged pot. The amendment is a destination, not a budget.
+
+**Storage.** Routing writes one key per stream, overwritten by every amendment,
+so growth is bounded by the number of streams that ever route rather than the
+number of amendments (`docs/FOOTPRINT.md`, Candidate 5). A terminal stream has no
+remainder to route: `set_refund_target` refuses with `StreamNotActive`, while the
+`refund_target` view keeps answering — the destination of a paid-out refund is
+audit information, not live state.
+
+**Off-chain.** The indexer projects `stream_refund_target_changed` into
+`streams.refund_target` (NULL = unrouted, i.e. the sender is paid) under the same
+monotonic-projection rule as the rest of the row, and the routing never enters
+`listAddress`: a routed address holds a claim, not a discoverable role. The
+stream detail page reads the `refund_target` view and warns when the answer
+differs from the sender, which is the only signal the contract gives — the view
+resolves the fallback rather than reporting an absent key.

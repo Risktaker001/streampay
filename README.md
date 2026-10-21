@@ -81,6 +81,8 @@ Metrics, alerting stack, and operational diagnosis: [`docs/RUNBOOK.md`](./docs/R
 | `propose_sender_transfer(caller, stream_id, new_sender, nonce, transfer_refund_rights)` | current sender | — (records a pending proposal) | `SenderTransferProposed` |
 | `accept_sender_transfer(caller, stream_id, nonce)` | recipient only | — (moves the payer role) | `SenderTransferred` |
 | `expire_sender_transfer(stream_id) → u64` | anyone, after the window | — (clears a dead proposal) | `SenderTransferExpired` |
+| `create_stream_with_refund(sender, recipient, token, deposit, start, end, cancelable, refund_to) → u64` | anyone (sender auth required) | pulls deposit in | `StreamCreated`; `StreamRefundTargetChanged` |
+| `set_refund_target(caller, stream_id, refund_to)` | sender-role holder, active streams | — (moves the refund destination) | `StreamRefundTargetChanged` |
 | `get_stream(stream_id) → Stream` | — (read-only) | — | — |
 | `available(stream_id) → i128` | — (read-only) | — | — |
 | `pending_ownership_transfer(stream_id) → Option<PendingOwnership>` | — (read-only) | — | — |
@@ -181,6 +183,26 @@ with whoever held it unless the proposal sets `transfer_refund_rights`, and
 `refund_target(stream_id)` always reports where the cancellation remainder
 would go. Both discovery index pages are rewritten and TTL-extended by the
 same shared index writers the creation path uses.
+
+### Refund routing
+
+The destination that paragraph defers to is directly addressable. A stream can
+be created with its refund already routed — `create_stream_with_refund(...,
+refund_to)` — and re-pointed later by whoever currently holds the sender role
+with `set_refund_target(stream_id, refund_to)`, which refuses a finished stream
+(`StreamNotActive`, 5), a caller outside the payer role (`RefundTargetNotSender`,
+71), and a routing to the address that already holds the claim
+(`RefundTargetUnchanged`, 72).
+
+Routing moves *where cancellation money goes* and nothing else: it grants no
+authority (the routed address still cannot cancel, top up or withdraw), and it
+never enters the accrual math, so a routed stream and an unrouted twin have
+identical records and identical remainders — only the destination differs. It
+composes with a sender-role hop in the order the two happen: a hop that does not
+move refund rights preserves the routing, a hop that does replaces it. Note the
+trap that follows: a pinned destination drains whatever the pot holds, so routing
+the claim before a later sender tops the stream up sends that larger remainder
+to the pinned address. See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §19.
 
 Any SEP-41-compatible asset can fund a stream: an issued asset via its
 Stellar Asset Contract id (e.g. USDC on testnet) or **native XLM** via its
